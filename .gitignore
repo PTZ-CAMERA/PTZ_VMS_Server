@@ -1,0 +1,7 @@
+build*/
+data/*
+!data/.gitkeep
+recordings/*
+!recordings/.gitkeep
+config/*.local.conf
+__pycache__/
