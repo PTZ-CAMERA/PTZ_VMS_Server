@@ -27,6 +27,14 @@ flowchart LR
 
 현재 Web 영상은 VMS를 경유하지 않습니다. WebRTC Gateway는 인터페이스 단계이며, Web PTZ 요청도 현재 VMS 계약에 맞춰 수정해야 합니다.
 
+## 관련 프로젝트
+
+| 저장소 | 역할과 영상 경로 |
+|---|---|
+| [PTZ_VMS_Server](https://github.com/PTZ-CAMERA/PTZ_VMS_Server) | 카메라 RTSP 수신·TCP/UDP 중계·녹화·ONVIF PTZ |
+| [Qt_Client](https://github.com/PTZ-CAMERA/Qt_Client) | VMS HTTP/WebSocket 및 VMS RTSP를 사용하는 데스크톱 클라이언트 |
+| [PTZ_WEB_Client](https://github.com/PTZ-CAMERA/PTZ_WEB_Client) | 별도 WHEP 영상과 VMS WebSocket을 사용하는 브라우저 클라이언트 |
+
 ## 현재 기능
 
 | 기능 | 상태 |
@@ -181,6 +189,8 @@ rtsp_public_host=<현재 WSL IPv4 주소>
 클라이언트는 약 200ms마다 새 requestId로 MOVE를 갱신하고 놓으면 STOP을 전송합니다. ContinuousMove Timeout은 PT1S, VMS 갱신 lease는 600ms입니다. 연결 단절·서버 종료 시에도 Stop을 시도합니다. 진행 중인 HTTP 요청은 완료/timeout 후 Stop으로 이어집니다.
 
 PTZ는 먼저 `type=response`, `data.phase=ACCEPTED`를 반환하고, 같은 requestId의 `PTZ_RESULT` 알림으로 `PI_ACKNOWLEDGED`, `FAILED`, `SUPERSEDED`를 전달합니다. `PI_ACKNOWLEDGED`는 ONVIF 응답 확인이며 모터 도착 완료가 아닙니다.
+
+카메라의 `capabilities.ptz`와 `capabilities.ptzCenter`로 이동·중앙 복귀 지원 여부를 확인합니다. 현재 Qt는 위 속도 필드와 주기적 갱신을 구현했습니다. 웹은 아직 `pan` / `tilt`를 보내고 이동을 주기적으로 갱신하지 않으므로 그대로 연결하면 서버의 PTZ 계약과 호환되지 않습니다. 웹에서 필드명·갱신·결과 알림 처리를 맞춰야 합니다.
 
 ## 검증과 후속 작업
 
