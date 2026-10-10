@@ -16,8 +16,14 @@ struct CameraSnapshot {
     int timeBaseNum = 0, timeBaseDen = 1;
     std::uint64_t packets = 0, bytes = 0;
     std::string streamUri;
+    // 공개 cameraJson에는 넣지 않는다. 직접 재생 REST 요청에서만 일시적으로 제공한다.
+    std::string directStreamUri, webRtcUri;
     bool streamReady = false;
     bool ptzReady = false, ptzCenter = false;
+    bool trackingSupported = false;
+    bool eventsEnabled = false;
+    bool chatEnabled = false;
+    std::string eventsStatus = "DISABLED";
     bool recording = false, recordingRequested = false;
     std::string recordingState = "STOPPED", recordingError, recordingFile;
 
@@ -35,7 +41,10 @@ public:
     void setDisconnectHandler(std::function<void(std::uint64_t)>); // Before start; dispatches to camera control executor.
     void updateRecording(const std::string& id, bool requested, bool active, const std::string& state, const std::string& error, const std::string& file);
     void updateCamera(const CameraSnapshot&);
+    void updateEvents(const std::string& id,const std::string& state);
+    void notify(const std::string& id,const std::string& event,const nlohmann::json& data);
     unsigned short port() const;
+    nlohmann::json cameraIds() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -8,6 +8,9 @@ struct RecordingEntry {
     std::string cameraId, filePath, codec;
     double duration = 0;
     int width = 0, height = 0;
+    bool hasTimeAnchor = false;
+    std::int64_t firstPts = 0, firstDts = 0;
+    int timeBaseNum = 0, timeBaseDen = 1;
 };
 struct sqlite3; // implementation keeps SQLite types private
 class RecordingRepository {

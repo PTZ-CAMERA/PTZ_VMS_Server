@@ -12,28 +12,27 @@ flowchart LR
     Files[("녹화 MKV / MP4")]
     DB[("SQLite 녹화 metadata")]
     Web["Web Browser"]
-    WHEP["Pi의 별도 WHEP 서버<br/>실제 가용성 확인 필요"]
+    WHEP["PC MediaMTX Gateway<br/>VMS relay 입력"]
     Pi -->|"RTSP H.264 :8554"| VMS
     VMS -->|"ONVIF Digest :8080"| Pi
     Qt <-->|"HTTP / WebSocket :5000"| VMS
-    VMS -->|"RTSP :8555 / TCP 또는 UDP"| Qt
+    Pi -->|"직접 RTSP :8554 / TCP 또는 UDP"| Qt
     VMS --> Files
     VMS --> DB
     Web <-->|"WebSocket 상태 조회"| VMS
-    Pi --> WHEP
+    VMS -->|"VMS RTSP :8555"| WHEP
     WHEP -->|"현재 Web 영상 경로"| Web
-    VMS -.->|"향후 WebRTC Gateway"| Web
 ```
 
-현재 Web 영상은 VMS를 경유하지 않습니다. WebRTC Gateway는 인터페이스 단계이며, Web PTZ 요청도 현재 VMS 계약에 맞춰 수정해야 합니다.
+현재 Qt 라이브는 Pi 직접 RTSP이고 Web 라이브는 VMS → PC MediaMTX → WebRTC입니다. 제어·메타데이터·녹화·검색은 VMS가 담당합니다. 녹화 재생은 Qt에만 유지합니다. [새 영상 경로·게이트웨이 실행](docs/LIVE_ROUTING.md)
 
 ## 관련 프로젝트
 
 | 저장소 | 역할과 영상 경로 |
 |---|---|
 | [PTZ_VMS_Server](https://github.com/PTZ-CAMERA/PTZ_VMS_Server) | 카메라 RTSP 수신·TCP/UDP 중계·녹화·ONVIF PTZ |
-| [Qt_Client](https://github.com/PTZ-CAMERA/Qt_Client) | VMS HTTP/WebSocket 및 VMS RTSP를 사용하는 데스크톱 클라이언트 |
-| [PTZ_WEB_Client](https://github.com/PTZ-CAMERA/PTZ_WEB_Client) | 별도 WHEP 영상과 VMS WebSocket을 사용하는 브라우저 클라이언트 |
+| [Qt_Client](https://github.com/PTZ-CAMERA/Qt_Client) | Pi 직접 RTSP 라이브 + VMS 제어·검색·녹화 재생 |
+| [PTZ_WEB_Client](https://github.com/PTZ-CAMERA/PTZ_WEB_Client) | VMS→PC MediaMTX→WebRTC 라이브 + VMS 제어·검색 |
 
 ## 현재 기능
 
@@ -46,7 +45,10 @@ flowchart LR
 | 녹화 검색 | SQLite에서 카메라·시간 범위 검색, 최대 100개 |
 | ONVIF PTZ | 서비스·프로필·좌표 조회, ContinuousMove/Stop/AbsoluteMove |
 | Client API | WebSocket 명령·상태 알림, HTTP 스트림 URI 조회 |
-| 이벤트·추적·WebRTC | 런타임 미구현. 별도 인터페이스로 분리 |
+| 자연어 검색 | Gemini JSON 조건 해석 → 탐지/이벤트 DB 검색 → 녹화 결과 카드 |
+| 탐지 이벤트 | ONVIF PullPoint 수신·Renew·재접속, 상태 변경 저장·검색, metadata 알림. 기본 비활성화. Pi 구독·초기 상태 DB 저장 확인, 실제 탐지→검색→녹화 재생 전체 시험은 남음 |
+| 추적 제어 | TRACKING_ON/OFF → Pi MoveAndStartTracking/Stop, PTZVector 지원 조회, metadata 상태 확인 |
+| WebRTC | VMS relay → PC MediaMTX 외부 프로세스 → 브라우저. 합성 영상 디코딩 확인 |
 | 원격 녹화 재생 | 파일 전달/재생 API 미구현. Qt는 접근 가능한 로컬 파일 재생 가능 |
 
 ## 내부 구조와 스레드
@@ -173,6 +175,8 @@ rtsp_public_host=<현재 WSL IPv4 주소>
 | `DISCOVER_CAMERAS`, `REGISTER_CAMERA` | WS ONVIF 검색·등록 |
 | `START_RECORDING`, `STOP_RECORDING`, `GET_RECORDINGS` | WS 녹화·검색 |
 | `PTZ_MOVE`, `PTZ_STOP`, `PTZ_CENTER` | WS 이동·정지·중앙 |
+| `GET_EVENTS`, `GET_DETECTIONS`, `GET_EVENT_PLAYBACK` | WS 상태 이력·탐지 샘플 검색, 완료 녹화·추정 offset 조회 |
+| `CHAT_SEARCH` | Gemini 질문·후속 조건·페이지·결과 선택 |
 
 목록/상태용 REST 경로는 아직 없으며 WebSocket을 사용합니다. 영상 미준비 상태는 HTTP 503 `STREAM_NOT_READY`입니다. 녹화 검색은 cameraId와 선택적인 `fromMs/toMs` epoch milliseconds, `limit` 1~100을 사용합니다.
 
@@ -190,13 +194,17 @@ rtsp_public_host=<현재 WSL IPv4 주소>
 
 PTZ는 먼저 `type=response`, `data.phase=ACCEPTED`를 반환하고, 같은 requestId의 `PTZ_RESULT` 알림으로 `PI_ACKNOWLEDGED`, `FAILED`, `SUPERSEDED`를 전달합니다. `PI_ACKNOWLEDGED`는 ONVIF 응답 확인이며 모터 도착 완료가 아닙니다.
 
-카메라의 `capabilities.ptz`와 `capabilities.ptzCenter`로 이동·중앙 복귀 지원 여부를 확인합니다. 현재 Qt는 위 속도 필드와 주기적 갱신을 구현했습니다. 웹은 아직 `pan` / `tilt`를 보내고 이동을 주기적으로 갱신하지 않으므로 그대로 연결하면 서버의 PTZ 계약과 호환되지 않습니다. 웹에서 필드명·갱신·결과 알림 처리를 맞춰야 합니다.
+카메라의 `capabilities.ptz`와 `capabilities.ptzCenter`로 이동·중앙 복귀 지원 여부를 확인합니다. Qt와 Web 모두 panVelocity/tiltVelocity, 200ms 갱신, 정지·중앙 복귀 및 접수/Pi 결과 알림을 처리합니다.
 
 ## 검증과 후속 작업
 
-CTest의 unit, discovery/registration, RTSP ingest, RTSP UDP relay, WebSocket, recording, PTZ 7개 테스트가 개발 세션에서 통과했습니다. Windows Qt의 TCP/UDP 영상은 사용자가 확인했고 실제 Pi PTZ 명령 응답도 확인했습니다. 서보 하드웨어의 방향·정지·중앙 동작 검증은 다음 단계입니다.
+Events와 채팅 unit/fixture 및 기존 RTSP/녹화/PTZ를 포함한 CTest 12개가 통과했습니다. 실제 Gemini API에서 한국어 검색 조건 해석을 확인했습니다. Pi 소스는 SSH로 읽기 검토했고 서비스 재시작·서보·실물 탐지·장시간 시험은 자동 실행하지 않았습니다. Windows Qt의 TCP/UDP 영상과 Pi PTZ 응답은 이전 결과이며 이번 metadata 변경의 실물 검증을 의미하지 않습니다.
 
-후속 작업: 영구 카메라 등록, 이벤트·추적, 원격 녹화 재생, WebRTC Gateway, Web PTZ 계약 연동.
+Events 수신·저장·검색·시간 연결과 프로젝트별 남은 작업은 [METADATA_VIDEO_SEARCH](docs/METADATA_VIDEO_SEARCH.md)를 참조합니다. 기본 events_enabled=false이며 확인한 Pi 필드 매핑은 내장되어 있습니다. Runtime/StateEvent가 선언되면 우선 사용하고 구버전은 property_fallback입니다. 누락 값은 null, 64bit frame 정보는 문자열, 녹화 탐색은 receive_estimated로 구분합니다. Qt 알림·검색 UI 연결은 별도 작업입니다.
+
+후속 작업: 실제 탐지→검색→녹화 재생 전체 시험, 장시간 안정성, 영구 카메라 등록, 추적 ON/OFF, 외부 접근 운영 설정. Qt/Web UI·PTZ·Web 게이트웨이는 연결했고 Web 녹화 재생은 사용자 요청으로 제외했습니다.
+
+[Gemini 자연어 검색·키 설정·Qt 계약](docs/CHAT_SEARCH.md). 키는 로컬 제외 파일에만 보관하며 Qt 채팅 UI 연결은 별도 작업입니다.
 
 [전체 설계](docs/VMS_ARCHITECTURE.md) · [WebSocket 기록](docs/WEBSOCKET_API.md) · [RTSP relay 기록](docs/RTSP_RELAY_API.md) · [Pi 연결 기록](docs/CAM01_CONNECTION_TEST.md)
 

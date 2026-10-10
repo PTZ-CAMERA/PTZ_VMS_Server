@@ -29,6 +29,13 @@ int main() {
             require(rejected);
         }
         vms::StreamManager manager;
+        // Pi가 받지 않는 Pull 상한은 시작 시 거절하여 반복 SOAP Fault를 방지한다.
+        for (const auto* text : {"events_pull_seconds=11\n", "events_message_limit=65\n", "webrtc_gateway_url=rtsp://localhost:8889\n", "webrtc_gateway_url=http://user:password@localhost:8889\n", "webrtc_gateway_url=http://localhost:8889/cam\n"}) {
+            { std::ofstream f(path); f << text; }
+            bool rejected=false;
+            try { (void)vms::loadConfig(path.string()); } catch (const std::exception&) { rejected=true; }
+            require(rejected);
+        }
         require(manager.status("missing") == vms::CameraStatus::OFFLINE);
         manager.stop("missing");
         manager.stopAll();

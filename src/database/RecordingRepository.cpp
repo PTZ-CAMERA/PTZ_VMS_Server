@@ -34,15 +34,29 @@ RecordingRepository::RecordingRepository(const std::string& path) {
         sql(db, "PRAGMA journal_mode=WAL;");
         sql(db, "CREATE TABLE IF NOT EXISTS recordings(id INTEGER PRIMARY KEY AUTOINCREMENT,camera_id TEXT NOT NULL,start_time INTEGER NOT NULL,end_time INTEGER NOT NULL,file_path TEXT NOT NULL UNIQUE,duration REAL NOT NULL,codec TEXT NOT NULL,width INTEGER NOT NULL,height INTEGER NOT NULL);");
         sql(db, "CREATE INDEX IF NOT EXISTS recording_camera_time ON recordings(camera_id,start_time,end_time);");
+        sql(db,"CREATE TABLE IF NOT EXISTS recording_time_anchors(recording_id INTEGER PRIMARY KEY,arrival_utc_ms INTEGER NOT NULL,first_pts INTEGER NOT NULL,first_dts INTEGER NOT NULL,time_base_num INTEGER NOT NULL,time_base_den INTEGER NOT NULL);");
     } catch (...) { sqlite3_close(db); db_ = nullptr; throw; }
 }
 RecordingRepository::~RecordingRepository() { if (db_) sqlite3_close(static_cast<::sqlite3*>(db_)); }
 void RecordingRepository::insert(const RecordingEntry& e) {
+    // 녹화 segment와 시각 anchor를 같은 트랜잭션에서 등록한다.
+    auto* db = static_cast<::sqlite3*>(db_); sql(db,"BEGIN IMMEDIATE;");
+    try {
     auto statement = prepare(static_cast<::sqlite3*>(db_), "INSERT INTO recordings(camera_id,start_time,end_time,file_path,duration,codec,width,height) VALUES(?,?,?,?,?,?,?,?);");
     text(statement.get(), 1, e.cameraId); sqlite3_bind_int64(statement.get(), 2, e.startMs); sqlite3_bind_int64(statement.get(), 3, e.endMs);
     text(statement.get(), 4, e.filePath); sqlite3_bind_double(statement.get(), 5, e.duration); text(statement.get(), 6, e.codec);
     sqlite3_bind_int(statement.get(), 7, e.width); sqlite3_bind_int(statement.get(), 8, e.height);
     if (sqlite3_step(statement.get()) != SQLITE_DONE) throw std::runtime_error("Recording metadata could not be saved");
+    if (e.hasTimeAnchor) {
+        const auto id = sqlite3_last_insert_rowid(db);
+        auto anchor = prepare(db,"INSERT INTO recording_time_anchors VALUES(?,?,?,?,?,?);");
+        sqlite3_bind_int64(anchor.get(),1,id); sqlite3_bind_int64(anchor.get(),2,e.startMs);
+        sqlite3_bind_int64(anchor.get(),3,e.firstPts); sqlite3_bind_int64(anchor.get(),4,e.firstDts);
+        sqlite3_bind_int(anchor.get(),5,e.timeBaseNum); sqlite3_bind_int(anchor.get(),6,e.timeBaseDen);
+        if (sqlite3_step(anchor.get()) != SQLITE_DONE) throw std::runtime_error("Recording time anchor could not be saved");
+    }
+    sql(db,"COMMIT;");
+    } catch (...) { sqlite3_exec(db,"ROLLBACK;",nullptr,nullptr,nullptr); throw; }
 }
 std::vector<RecordingEntry> RecordingRepository::list(const std::string& id, std::int64_t from, std::int64_t to, unsigned limit) {
     auto statement = prepare(static_cast<::sqlite3*>(db_), "SELECT id,camera_id,start_time,end_time,file_path,duration,codec,width,height FROM recordings WHERE camera_id=? AND end_time>? AND start_time<? ORDER BY start_time DESC,id DESC LIMIT ?;");

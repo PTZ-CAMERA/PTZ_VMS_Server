@@ -99,6 +99,9 @@ struct MuxRecorder::Impl {
         RecordingEntry entry; entry.cameraId = cameraId; entry.filePath = lastFile;
         entry.startMs = startMs; entry.endMs = startMs + static_cast<std::int64_t>(std::ceil(duration * 1000));
         entry.duration = duration; entry.codec = "H264"; entry.width = source.parameters->width; entry.height = source.parameters->height;
+        // 실제 캡처 UTC가 아니라 수신 UTC임을 별도 anchor로 보존한다.
+        entry.hasTimeAnchor = true; entry.firstPts = firstPts; entry.firstDts = firstDts;
+        entry.timeBaseNum = source.timeBase.num; entry.timeBaseDen = source.timeBase.den;
         repository.insert(entry);
         log(cameraId, "REC", "Segment saved: " + final.filename().u8string());
     }

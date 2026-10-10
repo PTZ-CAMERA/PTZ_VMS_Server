@@ -5,6 +5,7 @@ import socket
 import sys
 import tempfile
 import time
+import urllib.request
 from rtsp_integration import Fixture, Process
 from websocket_test_client import WebSocket, free_port
 
@@ -24,7 +25,8 @@ def main():
     half_open = None
     with tempfile.TemporaryDirectory() as temp:
         try:
-            p = Process(executable, Path(temp), fixture.port)
+            source_uri = f'rtsp://fixture:token@127.0.0.1:{fixture.port}/stream'
+            p = Process(executable, Path(temp), fixture.port, extra_config='webrtc_gateway_url=http://127.0.0.1:18889\n', rtsp_uri=source_uri)
             p.wait_for('Listening ws://')
             first = WebSocket(p.api_port)
             second = WebSocket(p.api_port)
@@ -34,11 +36,21 @@ def main():
             camera = result['data']['cameras'][0]
             assert camera['id'] == 'CAM01' and not camera['recording']
             assert not camera['capabilities']['ptz']
+            assert 'directStreamUri' not in camera and 'fixture:token' not in json.dumps(camera)
+            with urllib.request.urlopen(f'http://127.0.0.1:{p.api_port}/api/v1/cameras/CAM01/direct-stream?transport=udp') as reply:
+                direct = json.load(reply)['data']
+                assert direct['source'] == 'camera' and direct['uri'] == source_uri and direct['transport'] == 'udp'
+            web = first.request('GET_WEB_STREAM', 'CAM01')['data']
+            assert web['source'] == 'vms' and web['protocol'] == 'webrtc' and web['uri'] == 'http://127.0.0.1:18889/CAM01/whep'
+            assert source_uri not in json.dumps(web)
             assert 'password' not in json.dumps(result) and 'rtsp://' not in json.dumps(result)
             assert second.request('GET_CAMERA_STATUS', 'missing')['error']['code'] == 'CAMERA_NOT_FOUND'
             assert second.request('GET_CAMERA_STATUS')['error']['code'] == 'INVALID_REQUEST'
-            for command in ('TRACKING_ON', 'GET_EVENTS', 'START_LIVE', 'STOP_LIVE', 'unknown'):
+            for command in ('START_LIVE', 'STOP_LIVE', 'unknown'):
                 assert first.request(command, 'CAM01')['error']['code'] == 'NOT_SUPPORTED'
+            for command in ('TRACKING_ON','TRACKING_OFF'):
+                assert first.request(command,'CAM01')['error']['code']=='PTZ_NOT_AVAILABLE'
+            assert first.request('GET_EVENTS', 'CAM01')['data']['events'] == []
             assert first.request('PTZ_STOP', 'CAM01')['error']['code'] == 'PTZ_NOT_AVAILABLE'
             assert first.request('PTZ_MOVE', 'CAM01')['error']['code'] == 'INVALID_VELOCITY'
             first.send('not-json')

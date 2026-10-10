@@ -152,14 +152,15 @@ class Fixture:
 
 
 class Process:
-    def __init__(self, executable, root, port, delay=200):
+    def __init__(self, executable, root, port, delay=200, extra_config='', rtsp_uri=None):
         with socket.socket() as api_listener, socket.socket() as relay_listener:
             api_listener.bind(('127.0.0.1', 0))
             relay_listener.bind(('127.0.0.1', 0))
             self.api_port = api_listener.getsockname()[1]
             self.relay_port = relay_listener.getsockname()[1]
         config = root / f'vms-{port}.conf'
-        config.write_text(f'camera_id=CAM01\nrtsp_url=rtsp://127.0.0.1:{port}/stream\nconnect_timeout_ms=3000\nread_timeout_ms=800\nreconnect_delay_ms={delay}\nstats_interval_ms=200\nclient_port={self.api_port}\nrtsp_relay_port={self.relay_port}\nrecording_root={root / "recordings"}\nrecording_database={root / "vms.db"}\n')
+        uri = rtsp_uri or f'rtsp://127.0.0.1:{port}/stream'
+        config.write_text(f'camera_id=CAM01\nrtsp_url={uri}\nconnect_timeout_ms=3000\nread_timeout_ms=800\nreconnect_delay_ms={delay}\nstats_interval_ms=200\nclient_port={self.api_port}\nrtsp_relay_port={self.relay_port}\nrecording_root={root / "recordings"}\nrecording_database={root / "vms.db"}\n{extra_config}')
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
         self.proc = subprocess.Popen([executable, '--config', str(config)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=flags)
         self.lines = []

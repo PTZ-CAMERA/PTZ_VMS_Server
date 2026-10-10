@@ -4,6 +4,8 @@
 #include "recording/RecordingManager.h"
 #include "core/Logger.h"
 #include "ptz/PtzCommandRouter.h"
+#include "event/EventManager.h"
+#include "chat/ChatSearchService.h"
 extern "C" {
 #include <libavformat/avformat.h>
 }
@@ -46,6 +48,8 @@ struct CameraService::Impl {
     StreamManager streams;
     PtzCommandRouter ptz;
     RecordingManager recordings;
+    EventManager events;
+    ChatSearchService chat;
     std::map<std::string, std::shared_ptr<Context>> contexts; // Control thread only.
     std::map<std::string, std::string> discoveredIds; // Reserved URI identity; discovery never starts ingest.
     std::thread worker;
@@ -56,16 +60,25 @@ struct CameraService::Impl {
     Impl(StreamConfig options, WebSocketServer& server, RtspRelayServer& relayServer)
         : config(std::move(options)), api(server), relay(relayServer),
           recordings({config.recordingRoot, config.recordingSegmentDuration, config.recordingContainer}, config.recordingDatabase,
-              [this](const std::string& id, const RecordingStatus& status) { api.updateRecording(id, status.requested, status.active, status.state, status.error, status.filePath); }) {}
-    void startCamera(CameraInfo camera, const std::string& onvifStatus, bool ptzReady = false, bool ptzCenter = false) {
+              [this](const std::string& id, const RecordingStatus& status) { api.updateRecording(id, status.requested, status.active, status.state, status.error, status.filePath); }),
+          events(config,[this](const std::string& id,const std::string& kind,const Json& data){api.notify(id,kind,data);},
+              [this](const std::string& id,const std::string& state){api.updateEvents(id,state);}),
+          chat(config,events,[this]{return api.cameraIds();}) {}
+    void startCamera(CameraInfo camera, const std::string& onvifStatus, bool ptzReady = false, bool ptzCenter = false, bool tracking = false) {
         streams.stop(camera.id); // Join prior generation before modifying its context.
         relay.setOffline(camera.id);
         auto context = std::make_shared<Context>(); context->camera = std::move(camera);
         auto& snapshot = context->snapshot;
         snapshot.id = context->camera.id; snapshot.name = context->camera.name;
         snapshot.ptzReady = ptzReady; snapshot.ptzCenter = ptzCenter;
+        snapshot.trackingSupported = tracking;
+        snapshot.eventsEnabled = config.eventsEnabled;
+        snapshot.chatEnabled = config.chatEnabled;
         snapshot.ipAddress = context->camera.ipAddress; snapshot.onvifStatus = onvifStatus;
-        snapshot.streamUri = relay.uri(snapshot.id); api.updateCamera(snapshot);
+        snapshot.streamUri = relay.uri(snapshot.id);
+        snapshot.directStreamUri = context->camera.rtspUrl;
+        if (!config.webRtcBaseUrl.empty()) snapshot.webRtcUri = config.webRtcBaseUrl + "/" + snapshot.id + "/whep";
+        api.updateCamera(snapshot);
         contexts[snapshot.id] = context;
         auto options = config; options.cameraId = snapshot.id; options.rtspUrl = context->camera.rtspUrl;
         StreamCallbacks callbacks;
@@ -142,7 +155,10 @@ struct CameraService::Impl {
         catch (const std::exception&) { log(camera.id, "PTZ", "PTZ configuration unavailable; video remains available"); }
         // PTZ uses server-managed credentials, never credentials supplied in a PTZ request.
         if (!ptz.configure(ptzCamera, token, options)) throw std::runtime_error("Stop PTZ before re-registering camera");
-        const auto id = camera.id; startCamera(std::move(camera), "VERIFIED", !options.endpoint.empty(), !options.position.uri.empty());
+        const auto eventCamera = camera;
+        const auto id = camera.id; startCamera(std::move(camera), "VERIFIED", !options.endpoint.empty(), !options.position.uri.empty(), options.supportsTracking);
+        // 수신 worker는 영상/PTZ worker와 별도로 시작한다. 장치 오류가 등록 성공을 취소하지 않는다.
+        events.configure(eventCamera,token);
         log(id, "ONVIF", "Camera registered; profile=" + token + "; upstream URI kept private");
         return {{"cameraId", id}, {"profileToken", token}, {"onvifStatus", "VERIFIED"}, {"rtspUri", relay.uri(id)}};
     }
@@ -202,7 +218,7 @@ struct CameraService::Impl {
                 }
             }
         }
-        ptz.shutdown(); streams.stopAll(); recordings.stop(); contexts.clear();
+        chat.stop(); events.stop(); ptz.shutdown(); streams.stopAll(); recordings.stop(); contexts.clear();
         std::deque<Job> remaining;
         { std::lock_guard<std::mutex> lock(mutex); remaining.swap(jobs); }
         for (const auto& job : remaining) if (job.done) job.done(failure(job.request, "SHUTTING_DOWN", "VMS is stopping"));
@@ -215,20 +231,26 @@ CameraService::CameraService(StreamConfig config, WebSocketServer& api, RtspRela
         impl_->config.onvifUsername = credentials.username; impl_->config.onvifPassword = credentials.password;
     }
     CameraSnapshot snapshot; snapshot.id = impl_->config.cameraId; snapshot.name = "Raspberry Pi PTZ";
+    snapshot.eventsEnabled = impl_->config.eventsEnabled;
+    snapshot.chatEnabled = impl_->config.chatEnabled;
     snapshot.streamUri = impl_->relay.uri(snapshot.id);
     if (!impl_->config.rtspUrl.empty()) snapshot.ipAddress = parseCameraEndpoint(impl_->config.rtspUrl).host;
     impl_->api.updateCamera(snapshot);
 }
 CameraService::~CameraService() { stop(); }
-void CameraService::start() { impl_->ptz.start(); impl_->recordings.start(); impl_->worker = std::thread([this] { impl_->run(); }); }
+void CameraService::start() { impl_->events.start(); impl_->chat.start(); impl_->ptz.start(); impl_->recordings.start(); impl_->worker = std::thread([this] { impl_->run(); }); }
 void CameraService::stop() {
     { std::lock_guard<std::mutex> lock(impl_->mutex); impl_->stopping.store(true); }
     impl_->wake.notify_all(); if (impl_->worker.joinable()) impl_->worker.join();
 }
-void CameraService::disconnect(std::uint64_t session) { impl_->ptz.disconnect(session); }
+void CameraService::disconnect(std::uint64_t session) { impl_->ptz.disconnect(session); impl_->chat.disconnect(session); }
 void CameraService::request(const Json& request, std::function<void(Json)> completion) {
     const auto command = request.value("command", std::string{});
-    if (command == "PTZ_MOVE" || command == "PTZ_STOP" || command == "PTZ_CENTER") {
+    if (command == "CHAT_SEARCH") { impl_->chat.request(request,std::move(completion)); return; }
+    if (command == "GET_EVENTS" || command == "GET_DETECTIONS" || command == "GET_EVENT_PLAYBACK") {
+        impl_->events.request(request,std::move(completion)); return;
+    }
+    if (command == "PTZ_MOVE" || command == "PTZ_STOP" || command == "PTZ_CENTER" || command == "TRACKING_ON" || command == "TRACKING_OFF") {
         impl_->ptz.request(request, std::move(completion)); return;
     }
     bool queued = false;

@@ -142,12 +142,12 @@ CurlOnvifClient::CurlOnvifClient(const std::atomic<bool>& cancelled) : cancelled
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) throw std::runtime_error("Cannot initialize ONVIF HTTP runtime");
 }
 CurlOnvifClient::~CurlOnvifClient() { curl_global_cleanup(); }
-std::string CurlOnvifClient::soap(const CameraInfo& camera, const std::string& url, const std::string& ns, const std::string& operation, const std::string& body) {
+std::string CurlOnvifClient::soap(const CameraInfo& camera, const std::string& url, const std::string& ns, const std::string& operation, const std::string& body, const std::string& addressing, long timeoutMs) {
     httpUrl(url);
     if (parseCameraEndpoint(url).host != parseCameraEndpoint(camera.onvifUrl).host) throw std::runtime_error("ONVIF service endpoint changed camera host");
     const auto payload = "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:p=\"" + ns
-        + "\" xmlns:tt=\"http://www.onvif.org/ver10/schema\" xmlns:wsse=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd\" xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\"><s:Header>"
-        + security(camera) + "</s:Header><s:Body><p:" + operation + '>' + body + "</p:" + operation + "></s:Body></s:Envelope>";
+        + "\" xmlns:tt=\"http://www.onvif.org/ver10/schema\" xmlns:wsa=\"http://www.w3.org/2005/08/addressing\" xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\" xmlns:wsse=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd\" xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\"><s:Header>"
+        + addressing + security(camera) + "</s:Header><s:Body><p:" + operation + '>' + body + "</p:" + operation + "></s:Body></s:Envelope>";
     std::unique_ptr<CURL, CurlDeleter> handle(curl_easy_init()); if (!handle) throw std::bad_alloc();
     const auto contentType = "Content-Type: application/soap+xml; charset=utf-8; action=\"" + ns + '/' + operation + "\"";
     std::unique_ptr<curl_slist, HeadersDeleter> headers(curl_slist_append(nullptr, contentType.c_str())); if (!headers) throw std::bad_alloc();
@@ -159,7 +159,7 @@ std::string CurlOnvifClient::soap(const CameraInfo& camera, const std::string& u
     }
     curl_easy_setopt(handle.get(), CURLOPT_POSTFIELDS, payload.c_str()); curl_easy_setopt(handle.get(), CURLOPT_POSTFIELDSIZE, static_cast<long>(payload.size()));
     curl_easy_setopt(handle.get(), CURLOPT_NOSIGNAL, 1L); curl_easy_setopt(handle.get(), CURLOPT_NOPROXY, "*");
-    curl_easy_setopt(handle.get(), CURLOPT_CONNECTTIMEOUT_MS, 2000L); curl_easy_setopt(handle.get(), CURLOPT_TIMEOUT_MS, 3000L);
+    curl_easy_setopt(handle.get(), CURLOPT_CONNECTTIMEOUT_MS, 2000L); curl_easy_setopt(handle.get(), CURLOPT_TIMEOUT_MS, timeoutMs);
     curl_easy_setopt(handle.get(), CURLOPT_PROTOCOLS_STR, "http,https"); curl_easy_setopt(handle.get(), CURLOPT_FOLLOWLOCATION, 0L);
     curl_easy_setopt(handle.get(), CURLOPT_WRITEFUNCTION, &writeBody); curl_easy_setopt(handle.get(), CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(handle.get(), CURLOPT_HEADERFUNCTION, &headerBody); curl_easy_setopt(handle.get(), CURLOPT_HEADERDATA, &response);
@@ -215,7 +215,7 @@ DeviceInformation CurlOnvifClient::getDeviceInformation(const CameraInfo& camera
 }
 OnvifCapabilities CurlOnvifClient::getCapabilities(const CameraInfo& camera) {
     tinyxml2::XMLDocument doc; parse(doc, soap(camera, camera.onvifUrl, DeviceNs, "GetCapabilities", "<p:Category>All</p:Category>"));
-    OnvifCapabilities caps{camera.onvifUrl, value(find(doc.RootElement(), "Media"), "XAddr"), value(find(doc.RootElement(), "PTZ"), "XAddr")};
+    OnvifCapabilities caps{camera.onvifUrl, value(find(doc.RootElement(), "Media"), "XAddr"), value(find(doc.RootElement(), "PTZ"), "XAddr"), value(find(doc.RootElement(), "Events"), "XAddr")};
     capabilities_[camera.onvifUrl] = caps; return caps;
 }
 std::vector<MediaProfile> CurlOnvifClient::getProfiles(const CameraInfo& camera) {
@@ -252,6 +252,7 @@ OnvifCapabilities CurlOnvifClient::getServices(const CameraInfo& camera) {
         const auto ns = value(service, "Namespace"), url = value(service, "XAddr");
         if (ns == MediaNs) caps.mediaUrl = url;
         if (ns == PtzNs) caps.ptzUrl = url;
+        if (ns == "http://www.onvif.org/ver10/events/wsdl") caps.eventsUrl = url;
     }
     capabilities_[camera.onvifUrl] = caps; return caps;
 }
@@ -292,6 +293,15 @@ PtzConfiguration CurlOnvifClient::getConfigurationOptions(const CameraInfo& came
     auto* timeout = find(doc.RootElement(), "PTZTimeout");
     if (!timeout || duration(value(timeout, "Min")) > 1 || duration(value(timeout, "Max")) < 1)
         throw std::runtime_error("PT1S movement timeout unsupported");
+    // 카메라가 실제 광고한 MoveAndTrack 유형만 확인한다. 미지원 조회가 영상/PTZ 등록을 막지는 않는다.
+    try {
+        tinyxml2::XMLDocument caps;
+        parse(caps, soap(camera, services.ptzUrl, PtzNs, "GetServiceCapabilities", ""));
+        const auto* node = find(caps.RootElement(), "Capabilities");
+        const char* declared = node ? node->Attribute("MoveAndTrack") : nullptr;
+        std::istringstream types(declared ? declared : ""); std::string type;
+        while (types >> type) if (type == "PTZVector") result.supportsTracking = true;
+    } catch (const std::exception&) { result.supportsTracking = false; }
     setPtzConfiguration(camera, token, result); return result;
 }
 void CurlOnvifClient::setPtzConfiguration(const CameraInfo& camera, const std::string& token, const PtzConfiguration& options) {
@@ -302,7 +312,7 @@ Result CurlOnvifClient::ptzCommand(const CameraInfo& camera, const std::string& 
         const auto& options = ptz_.at({camera.onvifUrl, token});
         std::string body = "<p:ProfileToken>" + escape(token) + "</p:ProfileToken>";
         if (operation == "Stop") body += "<p:PanTilt>true</p:PanTilt><p:Zoom>false</p:Zoom>";
-        else {
+        else if (operation != "MoveAndStartTracking") {
             const bool moving = operation == "ContinuousMove";
             const auto& space = moving ? options.velocity : options.position;
             if (space.uri.empty() || !std::isfinite(x) || !std::isfinite(y) || x < space.minX || x > space.maxX || y < space.minY || y > space.maxY)
@@ -321,5 +331,11 @@ Result CurlOnvifClient::continuousMove(const CameraInfo& c, const std::string& t
 Result CurlOnvifClient::relativeMove(const CameraInfo&, const std::string&, float, float) { return {false, "NOT_SUPPORTED"}; }
 Result CurlOnvifClient::absoluteMove(const CameraInfo& c, const std::string& t, float x, float y) { return ptzCommand(c, t, "AbsoluteMove", x, y); }
 Result CurlOnvifClient::stop(const CameraInfo& c, const std::string& t) { return ptzCommand(c, t, "Stop"); }
+Result CurlOnvifClient::startTracking(const CameraInfo& c, const std::string& t) {
+    // TargetPosition 생략은 현재 위치에서 시작한다. 중앙 이동이나 GPIO 제어를 VMS에서 하지 않는다.
+    const auto found = ptz_.find({c.onvifUrl, t});
+    if (found == ptz_.end() || !found->second.supportsTracking) return {false, "TRACKING_NOT_SUPPORTED"};
+    return ptzCommand(c, t, "MoveAndStartTracking");
+}
 PtzStatus CurlOnvifClient::getStatus(const CameraInfo&, const std::string&) { throw std::runtime_error("PTZ status adapter is not implemented"); }
 }

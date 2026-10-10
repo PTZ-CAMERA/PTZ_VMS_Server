@@ -30,11 +30,11 @@ const char* statusName(CameraStatus status) {
 }
 Json cameraJson(const CameraSnapshot& s) {
     return {{"id", s.id}, {"name", s.name}, {"ipAddress", s.ipAddress}, {"status", statusName(s.status)},
-        {"recording", s.recording}, {"recordingRequested", s.recordingRequested}, {"recordingState", s.recordingState}, {"recordingError", s.recordingError}, {"onvifStatus", s.onvifStatus}, {"webRtcStatus", "NOT_IMPLEMENTED"},
+        {"recording", s.recording}, {"recordingRequested", s.recordingRequested}, {"recordingState", s.recordingState}, {"recordingError", s.recordingError}, {"onvifStatus", s.onvifStatus}, {"webRtcStatus", s.webRtcUri.empty() ? "NOT_CONFIGURED" : "EXTERNAL_GATEWAY_CONFIGURED"}, {"eventsStatus",s.eventsStatus},
         {"codec", s.codec}, {"width", s.width}, {"height", s.height}, {"fps", s.fps},
         {"timeBase", {{"num", s.timeBaseNum}, {"den", s.timeBaseDen}}},
         {"packets", s.packets}, {"bytes", s.bytes},
-        {"capabilities", {{"ptz", s.ptzReady}, {"ptzCenter", s.ptzCenter}, {"tracking", false}, {"live", s.streamReady}, {"recordings", true}, {"events", false}}}};
+        {"capabilities", {{"ptz", s.ptzReady}, {"ptzCenter", s.ptzCenter}, {"tracking", s.trackingSupported}, {"live", s.streamReady}, {"directLive", !s.directStreamUri.empty()}, {"webRtcLive", !s.webRtcUri.empty()}, {"recordings", true}, {"events", s.eventsEnabled}, {"chatSearch",s.chatEnabled}}}};
 }
 class Session;
 struct State : std::enable_shared_from_this<State> {
@@ -47,6 +47,7 @@ struct State : std::enable_shared_from_this<State> {
     std::mutex cameraMutex;
     std::map<std::string, CameraSnapshot> cameras;
     std::map<std::string, std::string> lastNotifications;
+    std::map<std::string, std::string> lastTracking; // io_context만 접근. 늦게 연결한 UI도 마지막 확인 상태를 받는다.
     bool stopping = false;
     WebSocketServer::CommandHandler commandHandler;
     std::function<void(std::uint64_t)> disconnectHandler;
@@ -73,7 +74,9 @@ struct State : std::enable_shared_from_this<State> {
                 if (transport != "tcp" && transport != "udp") return failure(http::status::bad_request, "INVALID_TRANSPORT", "Use transport=tcp or transport=udp");
             }
         }
-        const std::string prefix = "/api/v1/cameras/", suffix = "/stream";
+        const std::string prefix = "/api/v1/cameras/";
+        const bool direct = path.size() >= 14 && path.compare(path.size()-14, 14, "/direct-stream") == 0;
+        const std::string suffix = direct ? "/direct-stream" : "/stream";
         if (path.size() <= prefix.size() + suffix.size() || path.rfind(prefix, 0) != 0
             || path.compare(path.size() - suffix.size(), suffix.size(), suffix) != 0)
             return failure(http::status::not_found, "NOT_FOUND", "REST endpoint does not exist");
@@ -84,9 +87,10 @@ struct State : std::enable_shared_from_this<State> {
         const auto entry = copy.find(id);
         if (entry == copy.end()) return failure(http::status::not_found, "CAMERA_NOT_FOUND", "Camera is not registered");
         const auto& camera = entry->second;
-        const bool ready = camera.status == CameraStatus::ONLINE && camera.streamReady;
+        const bool ready = direct ? !camera.directStreamUri.empty() : camera.status == CameraStatus::ONLINE && camera.streamReady;
         Json data{{"cameraId", id}, {"ready", ready}, {"protocol", "rtsp"}, {"transport", transport}, {"transports", Json::array({"tcp", "udp"})},
-            {"uri", camera.streamUri + (selectedTransport ? "?transport=" + transport : std::string{})}, {"codec", camera.codec}, {"width", camera.width}, {"height", camera.height}, {"fps", camera.fps}};
+            {"source", direct ? "camera" : "vms"},
+            {"uri", direct ? camera.directStreamUri : camera.streamUri + (selectedTransport ? "?transport=" + transport : std::string{})}, {"codec", camera.codec}, {"width", camera.width}, {"height", camera.height}, {"fps", camera.fps}};
         if (!ready) {
             auto result = failure(http::status::service_unavailable, "STREAM_NOT_READY", "VMS stream is waiting for camera media and an IDR frame");
             result.second["data"] = std::move(data); return result;
@@ -105,7 +109,7 @@ struct State : std::enable_shared_from_this<State> {
             || id.get_ref<const std::string&>().size() > 128 || !request.contains("command") || !request["command"].is_string())
             return failure("INVALID_REQUEST", "Expected version=1, string requestId and command");
         const auto command = request["command"].get<std::string>();
-        if (command != "GET_CAMERA_LIST" && command != "GET_CAMERA_STATUS")
+        if (command != "GET_CAMERA_LIST" && command != "GET_CAMERA_STATUS" && command != "GET_WEB_STREAM")
             return failure("NOT_SUPPORTED", "Command is not implemented by this VMS version");
         const auto copy = snapshot();
         Json data;
@@ -118,7 +122,13 @@ struct State : std::enable_shared_from_this<State> {
                 return failure("INVALID_REQUEST", "cameraId is required");
             const auto camera = copy.find(request["cameraId"].get<std::string>());
             if (camera == copy.end()) return failure("CAMERA_NOT_FOUND", "Camera is not registered");
-            data = {{"camera", cameraJson(camera->second)}};
+            if (command == "GET_WEB_STREAM") {
+                const auto& value = camera->second;
+                if (value.webRtcUri.empty()) return failure("WEBRTC_NOT_CONFIGURED", "Configure the PC MediaMTX gateway URL");
+                // 설정/relay 준비와 실제 ICE 연결 성공은 구분한다. LIVE 판정은 Web의 decoded frame으로 한다.
+                data = {{"cameraId", value.id}, {"protocol", "webrtc"}, {"source", "vms"}, {"uri", value.webRtcUri},
+                    {"ready", value.status == CameraStatus::ONLINE && value.streamReady}, {"gateway", "mediamtx"}};
+            } else data = {{"camera", cameraJson(camera->second)}};
         }
         return {{"version", 1}, {"type", "response"}, {"requestId", id}, {"ok", true}, {"data", data}};
     }
@@ -200,7 +210,7 @@ private:
             const auto preliminary = owner->dispatch(request);
             const auto command = request.is_object() && request.contains("command") && request["command"].is_string()
                 ? request["command"].get<std::string>() : std::string{};
-            if (owner->commandHandler && (command == "DISCOVER_CAMERAS" || command == "REGISTER_CAMERA" || command == "START_RECORDING" || command == "STOP_RECORDING" || command == "GET_RECORDINGS" || command == "PTZ_MOVE" || command == "PTZ_STOP" || command == "PTZ_CENTER")
+            if (owner->commandHandler && (command == "DISCOVER_CAMERAS" || command == "REGISTER_CAMERA" || command == "START_RECORDING" || command == "STOP_RECORDING" || command == "GET_RECORDINGS" || command == "PTZ_MOVE" || command == "PTZ_STOP" || command == "PTZ_CENTER" || command == "TRACKING_ON" || command == "TRACKING_OFF" || command == "GET_EVENTS" || command == "GET_DETECTIONS" || command == "GET_EVENT_PLAYBACK" || command == "CHAT_SEARCH")
                 && preliminary.contains("error") && preliminary["error"].value("code", std::string{}) == "NOT_SUPPORTED") {
                 std::weak_ptr<Session> weak = self;
                 std::weak_ptr<State> weakOwner = owner;
@@ -210,7 +220,13 @@ private:
                         if (auto session = weak.lock()) session->send(result.dump());
                     });
                 });
-            } else self->send(preliminary.dump());
+            } else {
+                self->send(preliminary.dump());
+                if (command=="GET_CAMERA_STATUS" && preliminary.value("ok",false)) {
+                    const auto found=owner->lastTracking.find(request.value("cameraId",std::string{}));
+                    if (found!=owner->lastTracking.end()) self->send(found->second);
+                }
+            }
             if (!self->closed_) self->read();
         });
     }
@@ -292,6 +308,7 @@ Result WebSocketServer::start(const ClientServerOptions& options) {
         impl_->context.restart();
         impl_->state->stopping = false;
         impl_->state->lastNotifications.clear();
+        impl_->state->lastTracking.clear();
         const auto address = net::ip::make_address(options.bindAddress);
         const tcp::endpoint endpoint(address, options.port);
         auto& acceptor = impl_->state->acceptor;
@@ -340,6 +357,7 @@ void WebSocketServer::updateCamera(const CameraSnapshot& snapshot) {
     if (existing != impl_->state->cameras.end()) {
         copy.recording = existing->second.recording; copy.recordingRequested = existing->second.recordingRequested;
         copy.recordingState = existing->second.recordingState; copy.recordingError = existing->second.recordingError; copy.recordingFile = existing->second.recordingFile;
+        copy.eventsStatus = existing->second.eventsStatus;
     }
     impl_->state->cameras[snapshot.id] = std::move(copy);
 }
@@ -351,4 +369,24 @@ void WebSocketServer::publish(const std::string& cameraId, const std::string& no
     net::post(impl_->context, [state = impl_->state, text] { if (!state->stopping) state->broadcast(text); });
 }
 unsigned short WebSocketServer::port() const { return impl_->boundPort; }
+Json WebSocketServer::cameraIds() const {
+    auto ids=Json::array(); for (const auto& camera:impl_->state->snapshot()) ids.push_back(camera.first); return ids;
+}
+void WebSocketServer::updateEvents(const std::string& id,const std::string& status) {
+    std::lock_guard<std::mutex> lock(impl_->state->cameraMutex);
+    auto it=impl_->state->cameras.find(id); if (it!=impl_->state->cameras.end()) it->second.eventsStatus=status;
+}
+void WebSocketServer::notify(const std::string& id,const std::string& event,const Json& data) {
+    if (!impl_->running.load()) return;
+    const auto text=Json{{"version",1},{"type","notification"},{"event",event},{"cameraId",id},{"data",data}}.dump();
+    if (text.size()>65536) return;
+    net::post(impl_->context,[state=impl_->state,text,id,event,data]{
+        if (state->stopping) return;
+        if(event=="CAMERA_METADATA" && data.contains("tracking") && data["tracking"].is_boolean()) {
+            if(state->lastTracking.size()<32 || state->lastTracking.count(id))state->lastTracking[id]=text;
+        }
+        if(event=="EVENT_RECEIVER_STATUS" && (data.value("state",std::string{})=="RECONNECTING" || data.value("state",std::string{})=="STOPPED" || data.value("state",std::string{})=="DATABASE_ERROR"))state->lastTracking.erase(id);
+        state->broadcast(text);
+    });
+}
 }

@@ -20,7 +20,7 @@ struct Job {
 void report(const Job& job, const char* phase, bool ok, const std::string& code = {}) {
     if (!job.reply) return;
     Json data{{"cameraId", job.request.value("cameraId", std::string{})}, {"command", job.request.value("command", std::string{})},
-        {"phase", phase}, {"motorArrivalConfirmed", false}};
+        {"phase", phase}, {"motorArrivalConfirmed", false}, {"trackingStateConfirmed", false}};
     Json message{{"version", 1}, {"type", std::string(phase) == "ACCEPTED" || std::string(phase) == "REJECTED" ? "response" : "notification"},
         {"requestId", job.request.value("requestId", std::string{})}, {"ok", ok}, {"data", data}};
     if (message["type"] == "notification") message["event"] = "PTZ_RESULT";
@@ -34,7 +34,7 @@ struct PtzCommandRouter::Impl {
         std::string profile;
         PtzConfiguration options;
         std::uint64_t owner = 0;
-        bool busy = false, stopping = false;
+        bool busy = false, stopping = false, tracking = false;
         Clock::time_point lease{};
         std::optional<Job> pending;
     };
@@ -49,7 +49,7 @@ struct PtzCommandRouter::Impl {
     void stopTarget(Target& target) {
         if (target.pending) report(*target.pending, "SUPERSEDED", false, "SUPERSEDED_BY_STOP");
         Job stop; stop.request = {{"cameraId", target.camera.id}, {"command", "PTZ_STOP"}};
-        target.pending = std::move(stop); target.stopping = true;
+        target.pending = std::move(stop); target.stopping = true; target.tracking = false;
     }
     void run() {
         for (;;) {
@@ -60,7 +60,7 @@ struct PtzCommandRouter::Impl {
                 const auto now = Clock::now();
                 for (auto& entry : targets) {
                     auto& target = entry.second;
-                    if (target.owner && !target.stopping && (closing || now >= target.lease)) stopTarget(target);
+                    if (target.owner && !target.stopping && (closing || (!target.tracking && now >= target.lease))) stopTarget(target);
                 }
                 // Round-robin prevents a held button from starving other cameras.
                 auto select = [&](auto begin, auto end) {
@@ -83,13 +83,14 @@ struct PtzCommandRouter::Impl {
                 if (command == "PTZ_MOVE") result = onvif.continuousMove(copy.camera, copy.profile,
                     job.request.at("panVelocity").get<float>(), job.request.at("tiltVelocity").get<float>());
                 else if (command == "PTZ_CENTER") result = onvif.absoluteMove(copy.camera, copy.profile, 0, 0);
+                else if (command == "TRACKING_ON") result = onvif.startTracking(copy.camera, copy.profile);
                 else result = onvif.stop(copy.camera, copy.profile);
             }
             log(id, "PTZ", command + (result.ok ? " Pi acknowledged" : " failed: " + result.error));
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 auto& target = targets.at(id); target.busy = false;
-                if (command == "PTZ_STOP") { target.owner = 0; target.stopping = false; }
+                if (command == "PTZ_STOP" || command == "TRACKING_OFF") { target.owner = 0; target.stopping = false; target.tracking = false; }
                 else if (!result.ok && !target.stopping) stopTarget(target);
             }
             report(job, result.ok ? "PI_ACKNOWLEDGED" : "FAILED", result.ok, result.error);
@@ -124,7 +125,7 @@ void PtzCommandRouter::request(const Json& request, Reply reply) {
             || !request.contains("tiltVelocity") || !request["tiltVelocity"].is_number()) return reject("INVALID_VELOCITY");
         x = request["panVelocity"].get<float>(); y = request["tiltVelocity"].get<float>();
         if (!std::isfinite(x) || !std::isfinite(y) || std::abs(x) > 1 || std::abs(y) > 1) return reject("INVALID_VELOCITY");
-    } else if (command != "PTZ_STOP" && command != "PTZ_CENTER") return reject("NOT_SUPPORTED");
+    } else if (command != "PTZ_STOP" && command != "PTZ_CENTER" && command != "TRACKING_ON" && command != "TRACKING_OFF") return reject("NOT_SUPPORTED");
     const auto session = request.value("_sessionId", std::uint64_t{0});
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (!session || impl_->closing) return reject("UNAVAILABLE");
@@ -135,9 +136,11 @@ void PtzCommandRouter::request(const Json& request, Reply reply) {
     const auto& space = target.options.velocity;
     if (command == "PTZ_MOVE" && (x < space.minX || x > space.maxX || y < space.minY || y > space.maxY)) return reject("PTZ_OUT_OF_RANGE");
     if (command == "PTZ_CENTER" && target.options.position.uri.empty()) return reject("CENTER_NOT_SUPPORTED");
+    if (command == "TRACKING_ON" && !target.options.supportsTracking) return reject("TRACKING_NOT_SUPPORTED");
     target.owner = session;
     target.lease = Clock::now() + (command == "PTZ_CENTER" ? std::chrono::milliseconds(10000) : std::chrono::milliseconds(600));
-    target.stopping = command == "PTZ_STOP";
+    target.tracking = command == "TRACKING_ON";
+    target.stopping = command == "PTZ_STOP" || command == "TRACKING_OFF";
     if (target.pending) report(*target.pending, "SUPERSEDED", false, "SUPERSEDED");
     report(job, "ACCEPTED", true); // Enqueued before worker can emit its result.
     target.pending = std::move(job); impl_->wake.notify_one();
