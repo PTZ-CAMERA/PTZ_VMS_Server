@@ -12,7 +12,9 @@ class EventManager {
 public:
     using Publish = std::function<void(const std::string&,const std::string&,const nlohmann::json&)>;
     using Status = std::function<void(const std::string&,const std::string&)>;
-    EventManager(StreamConfig,Publish,Status);
+    using RecordingState = std::function<nlohmann::json(const std::string&)>;
+    using Observation = std::function<void(const std::string&,const nlohmann::json&)>;
+    EventManager(StreamConfig,Publish,Status,RecordingState = {},Observation = {});
     ~EventManager();
     void start();
     void configure(const CameraInfo&,const std::string& profile);

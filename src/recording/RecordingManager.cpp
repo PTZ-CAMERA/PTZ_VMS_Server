@@ -29,18 +29,22 @@ struct RecordingManager::Impl {
     RecordingOptions options;
     std::string databasePath;
     StatusCallback callback;
+    bool defaultAuto;
+    std::chrono::seconds postRoll;
     std::unique_ptr<RecordingRepository> repository; // Worker only; opened lazily.
     struct Track {
         std::shared_ptr<RecordingSource> source;
         std::unique_ptr<MuxRecorder> recorder;
         RecordingStatus status;
+        bool initialized=false, autoEnabled=false, manual=false, autoActive=false, personPresent=false, eventsHealthy=false, trackingEnabled=false, trackingKnown=false;
+        std::chrono::steady_clock::time_point deadline{};
     };
     std::map<std::string, Track> tracks;
     std::thread worker;
     std::mutex mutex;
     std::condition_variable wake;
     std::atomic<bool> stopping{false};
-    enum class Kind { Configure, Offline, Packet, Command, Fault };
+    enum class Kind { Configure, Offline, Packet, Command, Fault, Detection, Tracking };
     struct Task {
         Kind kind; std::string id;
         std::shared_ptr<RecordingSource> source;
@@ -53,8 +57,9 @@ struct RecordingManager::Impl {
     std::size_t queuedBytes = 0;
     bool overflow = false;
     std::map<std::string, bool> armed;
-    Impl(RecordingOptions config, std::string path, StatusCallback sink)
-        : options(std::move(config)), databasePath(std::move(path)), callback(std::move(sink)) {}
+    std::map<std::string, Json> snapshots; // 다른 worker에는 복사한 상태만 전달한다.
+    Impl(RecordingOptions config, std::string path, StatusCallback sink,bool automatic,unsigned seconds)
+        : options(std::move(config)), databasePath(std::move(path)), callback(std::move(sink)),defaultAuto(automatic),postRoll(seconds) {}
     RecordingRepository& db() {
         if (!repository) repository = std::make_unique<RecordingRepository>(databasePath);
         return *repository;
@@ -65,11 +70,26 @@ struct RecordingManager::Impl {
         if (track.recorder) status.filePath = track.recorder->filePath();
         if (status.state != "ERROR") status.state = !status.requested ? "STOPPED" : !track.source ? "WAITING_FOR_STREAM" : status.active ? "RECORDING" : "WAITING_KEYFRAME";
         { std::lock_guard<std::mutex> lock(mutex); armed[id] = status.requested; }
+        snapshotTrack(id, track);
         if (callback) callback(id, status);
+    }
+    void snapshotTrack(const std::string& id, const Track& track) {
+        auto data = statusJson(id, track.status);
+        data.erase("filePath"); // 아직 확정되지 않은 파일 경로는 클라이언트에 제공하지 않는다.
+        data["autoRecordingEnabled"]=track.autoEnabled; data["manualRecording"]=track.manual;
+        data["autoRecordingActive"]=track.autoActive; data["eventsHealthy"]=track.eventsHealthy;
+        data["trackingEnabled"]=track.trackingKnown ? Json(track.trackingEnabled) : Json(nullptr);
+        data["postSeconds"]=postRoll.count();
+        const bool active = track.recorder && track.recorder->active();
+        data["recording"] = active;
+        data["startTimeMs"] = active ? Json(track.recorder->startTimeMs()) : Json(nullptr);
+        data["endTimeMs"] = active ? Json(track.recorder->endTimeMs()) : Json(nullptr);
+        std::lock_guard<std::mutex> lock(mutex); snapshots[id] = std::move(data);
     }
     void failed(const std::string& id, Track& track, const std::string& error) {
         if (track.recorder) track.recorder->abort();
         track.status.requested = false; track.status.state = "ERROR"; track.status.error = error;
+        track.manual=false; track.autoActive=false;
         log(id, "REC", error); publish(id, track);
     }
     void checkResult(const Result& result) { if (!result.ok) throw std::runtime_error(result.error); }
@@ -77,6 +97,15 @@ struct RecordingManager::Impl {
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (stopping.load()) return false;
+            // 탐지 신호도 무제한으로 쌓지 않는다. 동일 카메라의 마지막 대기 신호만 교체한다.
+            if (task.kind==Kind::Detection) {
+                for (auto it=tasks.rbegin();it!=tasks.rend();++it) {
+                    if (it->id!=task.id) continue;
+                    if (it->kind!=Kind::Detection) break;
+                    *it=std::move(task); wake.notify_one(); return true;
+                }
+                if (tasks.size()>=1024) return false;
+            }
             if (task.kind == Kind::Command && std::count_if(tasks.begin(), tasks.end(), [](const Task& item) { return item.kind == Kind::Command; }) >= 64) return false;
             if (task.kind == Kind::Configure || task.kind == Kind::Offline) {
                 for (auto it = tasks.begin(); it != tasks.end();) {
@@ -109,12 +138,45 @@ struct RecordingManager::Impl {
             task.done(response(task.request, true, {{"recordings", entries}})); return;
         }
         auto& track = tracks[task.id];
+        if (!track.initialized) { track.autoEnabled=defaultAuto; track.initialized=true; }
         if (task.kind == Kind::Configure || task.kind == Kind::Offline) {
             if (track.recorder) checkResult(track.recorder->stop());
+            if (task.kind==Kind::Offline) { track.autoActive=false; track.personPresent=false; track.trackingKnown=false; track.status.requested=track.manual; }
             track.source = task.source;
             if (track.status.requested && track.source) {
                 if (!track.recorder) track.recorder = std::make_unique<MuxRecorder>(db());
                 checkResult(track.recorder->start(task.id, *track.source, options));
+            }
+        } else if (task.kind==Kind::Tracking) {
+            track.trackingKnown=true;
+            track.trackingEnabled=task.request.at("enabled").get<bool>();
+            if (!track.trackingEnabled) {
+                track.autoActive=false; track.personPresent=false; track.deadline={};
+                if (!track.manual) {
+                    track.status.requested=false;
+                    if (track.recorder) checkResult(track.recorder->stop());
+                    track.status.state.clear();
+                }
+            }
+        } else if (task.kind==Kind::Detection) {
+            const auto value=task.request.value("detected",Json(nullptr));
+            const bool recovering=!track.eventsHealthy;
+            track.eventsHealthy=task.request.value("available",false) && value.is_boolean();
+            if (!track.eventsHealthy) { track.trackingKnown=false; snapshotTrack(task.id,track); return; }
+            const bool present=value.get<bool>();
+            // 타임아웃/통신 오류를 사람이 떠났다는 신호로 해석하지 않는다.
+            if (!present && (track.personPresent || recovering)) track.deadline=std::chrono::steady_clock::now()+postRoll;
+            if (!present && track.autoActive && !track.personPresent && track.deadline==std::chrono::steady_clock::time_point{})
+                track.deadline=std::chrono::steady_clock::now()+postRoll;
+            track.personPresent=present;
+            if (present && track.trackingKnown && track.trackingEnabled && track.autoEnabled && track.source) {
+                track.autoActive=true; track.deadline=std::chrono::steady_clock::time_point{};
+                if (!track.status.requested) {
+                    if (!track.recorder) track.recorder=std::make_unique<MuxRecorder>(db());
+                    checkResult(track.recorder->start(task.id,*track.source,options));
+                    track.status.requested=true; track.status.state.clear(); track.status.error.clear();
+                    log(task.id,"REC","Person detected: automatic recording requested");
+                }
             }
         } else if (task.kind == Kind::Fault) {
             throw std::runtime_error("Could not copy recording packet or codec parameters");
@@ -122,32 +184,50 @@ struct RecordingManager::Impl {
             if (!track.status.requested || !track.source || !track.recorder) return;
             const auto before = track.recorder->active(); const auto path = track.recorder->filePath();
             track.recorder->setPacketTime(task.arrivalMs); checkResult(track.recorder->writePacket(task.packet.get()));
+            snapshotTrack(task.id, track);
             if (before == track.recorder->active() && path == track.recorder->filePath()) return;
         } else {
             const auto command = task.request.value("command", std::string{});
             if (command == "START_RECORDING") {
                 if (!track.source) throw std::runtime_error("Camera stream information is not ready");
+                track.manual=true;
                 if (!track.status.requested) {
                     if (!track.recorder) track.recorder = std::make_unique<MuxRecorder>(db());
                     checkResult(track.recorder->start(task.id, *track.source, options));
                     track.status.requested = true; track.status.state.clear(); track.status.error.clear();
                 }
             } else if (command == "STOP_RECORDING") {
+                track.manual=false; track.autoActive=false; track.personPresent=false; track.deadline={};
                 track.status.requested = false;
                 if (track.recorder) checkResult(track.recorder->stop());
                 track.status.state.clear(); track.status.error.clear();
+            } else if (command=="SET_AUTO_RECORDING") {
+                if (!task.request.contains("enabled") || !task.request["enabled"].is_boolean()) throw std::runtime_error("enabled must be boolean");
+                track.autoEnabled=task.request["enabled"].get<bool>();
+                if (!track.autoEnabled) {
+                    track.autoActive=false;
+                    if (!track.manual) {
+                        track.status.requested=false;
+                        if (track.recorder) checkResult(track.recorder->stop());
+                        track.status.state.clear();
+                    }
+                }
             }
         }
         publish(task.id, track);
-        if (task.done) task.done(response(task.request, true, statusJson(task.id, track.status)));
+        if (task.done) {
+            auto data=statusJson(task.id,track.status); data["autoRecordingEnabled"]=track.autoEnabled;
+            task.done(response(task.request,true,data));
+        }
     }
     void run() {
         for (;;) {
             Task task; bool gap;
             {
                 std::unique_lock<std::mutex> lock(mutex);
-                wake.wait(lock, [&] { return stopping.load() || !tasks.empty(); });
+                wake.wait_for(lock,std::chrono::milliseconds(100), [&] { return stopping.load() || !tasks.empty(); });
                 if (tasks.empty() && stopping.load()) break;
+                if (tasks.empty()) { lock.unlock(); expireAutomatic(); continue; }
                 task = std::move(tasks.front()); tasks.pop_front();
                 if (task.packet) queuedBytes -= static_cast<std::size_t>(task.packet->size);
                 gap = overflow; overflow = false;
@@ -165,9 +245,10 @@ struct RecordingManager::Impl {
             }
             try { process(task); }
             catch (const std::exception& error) {
-                if (task.kind != Kind::Command || task.request.value("command", std::string{}) != "GET_RECORDINGS") failed(task.id, tracks[task.id], error.what());
+                if (task.kind != Kind::Command || task.request.value("command",std::string{})!="GET_RECORDINGS") failed(task.id, tracks[task.id], error.what());
                 if (task.done) task.done(response(task.request, false, {}, error.what()));
             }
+            expireAutomatic();
         }
         for (auto& entry : tracks) {
             auto& track = entry.second; track.status.requested = false;
@@ -176,10 +257,31 @@ struct RecordingManager::Impl {
         }
         tracks.clear(); repository.reset();
     }
+    void expireAutomatic() {
+        const auto now=std::chrono::steady_clock::now();
+        for (auto& entry:tracks) {
+            auto& t=entry.second;
+            if (!t.autoActive || t.personPresent || !t.eventsHealthy || t.deadline==std::chrono::steady_clock::time_point{} || now<t.deadline) continue;
+            t.autoActive=false;
+            try {
+                if (!t.manual) {
+                    t.status.requested=false;
+                    if (t.recorder) checkResult(t.recorder->stop());
+                    t.status.state.clear(); log(entry.first,"REC","Person absent: automatic recording finalized");
+                }
+                publish(entry.first,t);
+            } catch (const std::exception& e) { failed(entry.first,t,e.what()); }
+        }
+    }
 };
-RecordingManager::RecordingManager(RecordingOptions options, std::string db, StatusCallback callback)
-    : impl_(std::make_unique<Impl>(std::move(options), std::move(db), std::move(callback))) {}
+RecordingManager::RecordingManager(RecordingOptions options, std::string db, StatusCallback callback,bool automatic,unsigned seconds)
+    : impl_(std::make_unique<Impl>(std::move(options), std::move(db), std::move(callback),automatic,seconds)) {}
 RecordingManager::~RecordingManager() { stop(); }
+nlohmann::json RecordingManager::snapshot(const std::string& id) const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto it = impl_->snapshots.find(id);
+    return it == impl_->snapshots.end() ? Json{{"cameraId",id},{"recording",false},{"state","STOPPED"}} : it->second;
+}
 void RecordingManager::start() { impl_->worker = std::thread([this] { impl_->run(); }); }
 void RecordingManager::stop() {
     { std::lock_guard<std::mutex> lock(impl_->mutex); impl_->stopping.store(true); }
@@ -205,7 +307,20 @@ void RecordingManager::pushPacket(const std::string& id, const AVPacket* input) 
     impl_->enqueue(std::move(task));
 }
 void RecordingManager::request(const Json& request, std::function<void(Json)> done) {
+    // 불량 설정 요청은 기존 녹화 상태에 영향을 주지 않는다. 실제 저장 오류는 worker에서 처리한다.
+    if (request.value("command",std::string{})=="SET_AUTO_RECORDING" && (!request.contains("enabled") || !request["enabled"].is_boolean())) {
+        done(response(request,false,{},"enabled must be boolean")); return;
+    }
     Impl::Task task{}; task.kind = Impl::Kind::Command; task.id = request.value("cameraId", std::string{}); task.request = request; task.done = done;
     if (!impl_->enqueue(std::move(task))) done(response(request, false, {}, "Recording worker queue is unavailable"));
+}
+void RecordingManager::detection(const std::string& id,const Json& detected,bool available) {
+    Impl::Task task{}; task.kind=Impl::Kind::Detection; task.id=id;
+    task.request={{"detected",detected},{"available",available}};
+    impl_->enqueue(std::move(task));
+}
+void RecordingManager::tracking(const std::string& id,bool enabled) {
+    Impl::Task task{}; task.kind=Impl::Kind::Tracking; task.id=id; task.request={{"enabled",enabled}};
+    impl_->enqueue(std::move(task));
 }
 }

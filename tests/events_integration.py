@@ -19,6 +19,7 @@ from websocket_test_client import WebSocket, free_port
 
 def main():
     runtime_mode = len(sys.argv) > 3 and sys.argv[3] == 'runtime'
+    auto_mode = len(sys.argv) > 3 and sys.argv[3] == 'auto'
     fixture = Fixture(Path(sys.argv[2]).read_bytes())
     operations, failures = [], []
     notifications = []
@@ -124,6 +125,8 @@ def main():
             root = Path(tmp); api, relay = free_port(), free_port()
             config = root / 'vms.conf'
             config.write_text(f'rtsp_url=\nonvif_url=http://127.0.0.1:{http.server_port}/device\nonvif_username=user\nonvif_password=secret\nclient_port={api}\nrtsp_relay_port={relay}\nevents_enabled=true\nevents_pull_seconds=1\nevents_retry_ms=100\nmetadata_sample_ms=100\nrecording_root=recordings\nrecording_database=data/vms.db\n')
+            if auto_mode:
+                config.write_text(config.read_text().replace('events_retry_ms=100','events_retry_ms=1800')+'auto_recording_enabled=false\nauto_recording_post_seconds=1\n')
             process = subprocess.Popen([sys.argv[1], '--config', str(config)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             logs = []
             def drain():
@@ -149,6 +152,50 @@ def main():
             time.sleep(.3)
             assert call('GET_EVENTS', cameraId='CAM01')['events'] == []
             wait(lambda: call('GET_CAMERA_STATUS', cameraId='CAM01')['camera']['status'] == 'ONLINE')
+            if auto_mode:
+                def push(*messages):
+                    with lock: pending.extend(messages)
+                def recording(): return call('GET_CAMERA_STATUS',cameraId='CAM01')['camera']['recording']
+                def health(): return call('GET_METADATA_STATUS',cameraId='CAM01')['recording']
+                call('SET_AUTO_RECORDING',cameraId='CAM01',enabled=True)
+                push(message(True))
+                wait(lambda: call('GET_METADATA_STATUS',cameraId='CAM01')['detected'] is True)
+                assert not recording(), 'Tracking OFF must never start automatic recording'
+                push(message(True,topic='Tracking/State'),message(True))
+                wait(recording)
+                push(message(False)); time.sleep(.35); push(message(True))
+                time.sleep(1.15); assert recording(), 'Re-detection must keep the same recording'
+                call('START_RECORDING',cameraId='CAM01')
+                client.send(json.dumps(dict(version=1,requestId='invalid-auto',command='SET_AUTO_RECORDING',cameraId='CAM01',enabled='yes')))
+                while True:
+                    invalid=client.receive()
+                    if invalid.get('requestId')=='invalid-auto':
+                        assert not invalid['ok'];break
+                assert recording(), 'Invalid mode request must not stop existing recording'
+                push(message(False)); time.sleep(1.3)
+                assert recording() and health()['manualRecording'], 'Automatic expiry must not stop manual recording'
+                call('STOP_RECORDING',cameraId='CAM01'); assert not recording()
+                push(message(True)); wait(recording)
+                time.sleep(.15)
+                push(message(True,extra='<t:SimpleItem Name="Confidence" Value="0.92"/>'))
+                wait(lambda: len(call('GET_DETECTIONS',cameraId='CAM01',minConfidence=.9)['detections'])>0)
+                selected=call('GET_DETECTIONS',cameraId='CAM01',minConfidence=.9)['detections'][0]
+                wait(lambda: call('GET_EVENT_PLAYBACK',sampleId=selected['sampleId'],allowEstimated=True)['reason']=='RECORDING_IN_PROGRESS')
+                push(message(False)); wait(lambda:not recording())
+                playback=call('GET_EVENT_PLAYBACK',sampleId=selected['sampleId'],allowEstimated=True)
+                assert playback['playable'] and Path(playback['recording']['filePath']).is_file()
+                push(message(True)); wait(recording)
+                push(message(False,topic='Tracking/State')); wait(lambda:not recording())
+                push(message(True,topic='Tracking/State'),message(True)); wait(recording)
+                push(message(False)); time.sleep(.2)
+                with lock: fail_pull[0]=True
+                wait(lambda:not health()['eventsHealthy'])
+                time.sleep(1.1); assert recording(), 'Events failure is not person absence'
+                call('SET_AUTO_RECORDING',cameraId='CAM01',enabled=False); wait(lambda:not recording())
+                process.send_signal(signal.SIGINT); process.wait(timeout=8); assert process.returncode==0
+                assert not failures,failures
+                print('PASS automatic recording Tracking gate/re-detection/post-roll/manual ownership/event failure/search/playback')
+                return
             call('START_RECORDING', cameraId='CAM01')
             wait(lambda: call('GET_CAMERA_STATUS', cameraId='CAM01')['camera']['recording'])
             time.sleep(.15)
@@ -185,12 +232,17 @@ def main():
                 assert found[0]['bboxWidth'] is None and found[0]['panCommandAngle'] is None
             samples = call('GET_DETECTIONS', cameraId='CAM01', minConfidence=.8)['detections']
             assert len(samples) == 1 and samples[0]['frameId'] == '9007199254740993'
+            health = call('GET_METADATA_STATUS', cameraId='CAM01')
+            assert health['storedDetections'] == 1 and health['storedEvents'] == 3
+            assert health['lastReceivedTimeMs'] and health['lastStoredTimeMs']
+            assert health['detected'] is False and health['samplingEnabled']
+            assert call('GET_METADATA_STATUS', cameraId='CAM02')['storedDetections'] == 0
             assert samples[0]['streamEpoch'] == '9007199254740995' and samples[0]['framePtsNs'] == '9007199254740997'
             page = call('GET_EVENTS', cameraId='CAM01', limit=1)
             page2 = call('GET_EVENTS', cameraId='CAM01', limit=1, cursor=page['nextCursor'])
             assert page['events'][0]['id'] != page2['events'][0]['id']
             assert not call('GET_EVENT_PLAYBACK', eventId=found[0]['id'])['playable']
-            assert call('GET_EVENT_PLAYBACK', eventId=found[0]['id'], allowEstimated=True)['reason'] == 'NO_RECORDING_AT_TIME'
+            wait(lambda: call('GET_EVENT_PLAYBACK', eventId=found[0]['id'], allowEstimated=True)['reason'] == 'RECORDING_IN_PROGRESS')
             call('STOP_RECORDING', cameraId='CAM01')
             playback = call('GET_EVENT_PLAYBACK', eventId=found[0]['id'], allowEstimated=True)
             assert playback['playable'] and playback['offsetMs'] >= 0 and playback['timeMapping'] == 'receive_estimated'

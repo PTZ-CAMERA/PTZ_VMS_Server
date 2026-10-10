@@ -10,7 +10,7 @@ struct RecordingStatus {
 class RecordingManager {
 public:
     using StatusCallback = std::function<void(const std::string&, const RecordingStatus&)>;
-    RecordingManager(RecordingOptions, std::string databasePath, StatusCallback);
+    RecordingManager(RecordingOptions, std::string databasePath, StatusCallback,bool autoEnabled=false,unsigned postSeconds=10);
     ~RecordingManager();
     void start();
     void stop();
@@ -18,6 +18,9 @@ public:
     void offline(const std::string&);
     void pushPacket(const std::string&, const AVPacket*);
     void request(const nlohmann::json&, std::function<void(nlohmann::json)>);
+    nlohmann::json snapshot(const std::string& cameraId) const;
+    void detection(const std::string&,const nlohmann::json& detected,bool available);
+    void tracking(const std::string&,bool enabled);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

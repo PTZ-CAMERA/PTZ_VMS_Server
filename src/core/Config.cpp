@@ -46,6 +46,15 @@ StreamConfig loadConfig(const std::string& path) {
         else if (key == "chat_api_base") result.chatApiBase = value;
         else if (key == "chat_api_key_file") result.chatApiKeyFile = value;
         else if (key == "chat_timeout_ms") result.chatTimeoutMs = static_cast<unsigned>(duration(value).count());
+        else if (key == "auto_recording_enabled") {
+            if (value != "true" && value != "false") throw std::runtime_error("auto_recording_enabled must be true/false");
+            result.autoRecordingEnabled = value == "true";
+        }
+        else if (key == "auto_recording_post_seconds") {
+            std::size_t used=0; const auto seconds=std::stoll(value,&used);
+            if (used!=value.size() || seconds<1 || seconds>3600) throw std::runtime_error("auto_recording_post_seconds must be 1..3600");
+            result.autoRecordingPostSeconds=static_cast<unsigned>(seconds);
+        }
         else if (key == "events_enabled") {
             if (value != "true" && value != "false") throw std::runtime_error("events_enabled must be true/false");
             result.eventsEnabled = value == "true";
@@ -80,7 +89,16 @@ StreamConfig loadConfig(const std::string& path) {
         }
         else if (key == "rtsp_relay_bind") result.relayBind = value;
         else if (key == "rtsp_public_host") result.relayPublicHost = value;
-        else if (key == "webrtc_gateway_url") result.webRtcBaseUrl = value;
+        else if (key == "webrtc_enabled") {
+            if(value!="true" && value!="false")throw std::runtime_error("webrtc_enabled must be true/false");
+            result.webRtcEnabled=value=="true";
+        }
+        else if(key=="webrtc_gateway_url")throw std::runtime_error("webrtc_gateway_url was removed; use webrtc_enabled for native WebRTC");
+        else if(key=="webrtc_port_begin" || key=="webrtc_port_end") {
+            std::size_t used=0;auto n=std::stoll(value,&used);
+            if(used!=value.size() || n<1024 || n>65535)throw std::runtime_error("Invalid WebRTC port range");
+            if(key=="webrtc_port_begin")result.webRtcPortBegin=static_cast<unsigned short>(n);else result.webRtcPortEnd=static_cast<unsigned short>(n);
+        }
         else if (key == "client_port" || key == "rtsp_relay_port") {
             std::size_t used = 0;
             const auto port = std::stol(value, &used);
@@ -107,20 +125,7 @@ StreamConfig loadConfig(const std::string& path) {
     for (unsigned char c : result.relayPublicHost)
         if (!std::isalnum(c) && c != '.' && c != '-' && c != ':' && c != '[' && c != ']')
             throw std::runtime_error("Invalid rtsp_public_host");
-    if (!result.webRtcBaseUrl.empty()) {
-        auto* url = curl_url();
-        if (!url) throw std::runtime_error("Cannot validate gateway URL");
-        const auto part = [&](CURLUPart key) { char* raw = nullptr; std::string value;
-            if (curl_url_get(url, key, &raw, 0) == CURLUE_OK) { value = raw; curl_free(raw); } return value; };
-        const bool parsed = curl_url_set(url, CURLUPART_URL, result.webRtcBaseUrl.c_str(), 0) == CURLUE_OK;
-        const auto scheme = part(CURLUPART_SCHEME), host = part(CURLUPART_HOST), pathPart = part(CURLUPART_PATH);
-        const bool valid = parsed && (scheme == "http" || scheme == "https") && !host.empty()
-            && part(CURLUPART_USER).empty() && part(CURLUPART_PASSWORD).empty()
-            && part(CURLUPART_QUERY).empty() && part(CURLUPART_FRAGMENT).empty() && (pathPart.empty() || pathPart == "/");
-        curl_url_cleanup(url);
-        if (!valid) throw std::runtime_error("webrtc_gateway_url must be an HTTP(S) origin without credentials, path, query or fragment");
-        while (result.webRtcBaseUrl.back() == '/') result.webRtcBaseUrl.pop_back();
-    }
+    if(result.webRtcPortBegin>result.webRtcPortEnd)throw std::runtime_error("Invalid WebRTC port range");
     if (result.recordingRoot.empty() || result.recordingDatabase.empty() || (result.recordingContainer != "mkv" && result.recordingContainer != "mp4"))
         throw std::runtime_error("Invalid recording configuration");
     const auto configDirectory = std::filesystem::absolute(std::filesystem::u8path(path)).parent_path();

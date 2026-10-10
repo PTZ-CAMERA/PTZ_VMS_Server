@@ -154,4 +154,6 @@ Result MuxRecorder::stop() {
 void MuxRecorder::abort() noexcept { impl_->enabled = false; impl_->output.reset(); }
 bool MuxRecorder::active() const { return impl_->output && impl_->packetCount > 0; }
 std::string MuxRecorder::filePath() const { return impl_->lastFile; }
+std::int64_t MuxRecorder::startTimeMs() const { return impl_->startMs; }
+std::int64_t MuxRecorder::endTimeMs() const { return impl_->startMs + static_cast<std::int64_t>(std::ceil(impl_->duration * 1000)); }
 }

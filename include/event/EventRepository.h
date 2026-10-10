@@ -16,6 +16,7 @@ public:
     nlohmann::json search(const nlohmann::json& request);
     nlohmann::json detections(const nlohmann::json& request);
     nlohmann::json playback(const nlohmann::json& request);
+    nlohmann::json status(const std::string& cameraId);
 private:
     nlohmann::json searchRecords(const nlohmann::json&,bool detections);
     void* db_ = nullptr;

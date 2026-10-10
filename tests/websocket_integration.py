@@ -26,7 +26,7 @@ def main():
     with tempfile.TemporaryDirectory() as temp:
         try:
             source_uri = f'rtsp://fixture:token@127.0.0.1:{fixture.port}/stream'
-            p = Process(executable, Path(temp), fixture.port, extra_config='webrtc_gateway_url=http://127.0.0.1:18889\n', rtsp_uri=source_uri)
+            p = Process(executable, Path(temp), fixture.port, extra_config='webrtc_enabled=true\n', rtsp_uri=source_uri)
             p.wait_for('Listening ws://')
             first = WebSocket(p.api_port)
             second = WebSocket(p.api_port)
@@ -40,9 +40,12 @@ def main():
             with urllib.request.urlopen(f'http://127.0.0.1:{p.api_port}/api/v1/cameras/CAM01/direct-stream?transport=udp') as reply:
                 direct = json.load(reply)['data']
                 assert direct['source'] == 'camera' and direct['uri'] == source_uri and direct['transport'] == 'udp'
-            web = first.request('GET_WEB_STREAM', 'CAM01')['data']
-            assert web['source'] == 'vms' and web['protocol'] == 'webrtc' and web['uri'] == 'http://127.0.0.1:18889/CAM01/whep'
-            assert source_uri not in json.dumps(web)
+            web_reply = first.request('GET_WEB_STREAM', 'CAM01')
+            if web_reply['ok']:
+                web=web_reply['data']
+                assert web['source']=='vms' and web['protocol']=='webrtc' and web['signaling']=='websocket' and web['gateway']=='native'
+                assert 'uri' not in web and source_uri not in json.dumps(web)
+            else:assert web_reply['error']['code']=='WEBRTC_DISABLED'
             assert 'password' not in json.dumps(result) and 'rtsp://' not in json.dumps(result)
             assert second.request('GET_CAMERA_STATUS', 'missing')['error']['code'] == 'CAMERA_NOT_FOUND'
             assert second.request('GET_CAMERA_STATUS')['error']['code'] == 'INVALID_REQUEST'

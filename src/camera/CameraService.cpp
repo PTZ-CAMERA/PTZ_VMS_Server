@@ -1,4 +1,5 @@
 #include "camera/CameraService.h"
+#include "webrtc/WebRtcGateway.h"
 #include "onvif/CurlOnvifClient.h"
 #include "stream/StreamManager.h"
 #include "recording/RecordingManager.h"
@@ -50,6 +51,7 @@ struct CameraService::Impl {
     RecordingManager recordings;
     EventManager events;
     ChatSearchService chat;
+    WebRtcGateway webRtc;
     std::map<std::string, std::shared_ptr<Context>> contexts; // Control thread only.
     std::map<std::string, std::string> discoveredIds; // Reserved URI identity; discovery never starts ingest.
     std::thread worker;
@@ -60,10 +62,20 @@ struct CameraService::Impl {
     Impl(StreamConfig options, WebSocketServer& server, RtspRelayServer& relayServer)
         : config(std::move(options)), api(server), relay(relayServer),
           recordings({config.recordingRoot, config.recordingSegmentDuration, config.recordingContainer}, config.recordingDatabase,
-              [this](const std::string& id, const RecordingStatus& status) { api.updateRecording(id, status.requested, status.active, status.state, status.error, status.filePath); }),
+              [this](const std::string& id, const RecordingStatus& status) { api.updateRecording(id, status.requested, status.active, status.state, status.error, status.filePath); },config.autoRecordingEnabled,config.autoRecordingPostSeconds),
           events(config,[this](const std::string& id,const std::string& kind,const Json& data){api.notify(id,kind,data);},
-              [this](const std::string& id,const std::string& state){api.updateEvents(id,state);}),
-          chat(config,events,[this]{return api.cameraIds();}) {}
+              [this](const std::string& id,const std::string& state){
+                  api.updateEvents(id,state);
+                  if (state!="SUBSCRIBED") recordings.detection(id,nullptr,false);
+              },
+              [this](const std::string& id){return recordings.snapshot(id);},
+              [this](const std::string& id,const Json& data){
+                  const auto topic=data.at("topic").get<std::string>();
+                  if (topic=="Tracking/State" && data.at("tracking").is_boolean()) recordings.tracking(id,data.at("tracking").get<bool>());
+                  if (topic=="Analytics/PersonDetection") recordings.detection(id,data.at("detected"),data.at("available")!=false);
+              }),
+          chat(config,events,[this]{return api.cameraIds();}),
+          webRtc(config,[this](std::uint64_t session,const std::string& camera,const Json& data){api.notifySession(session,camera,"WEBRTC_STATE",data);}) {}
     void startCamera(CameraInfo camera, const std::string& onvifStatus, bool ptzReady = false, bool ptzCenter = false, bool tracking = false) {
         streams.stop(camera.id); // Join prior generation before modifying its context.
         relay.setOffline(camera.id);
@@ -77,7 +89,7 @@ struct CameraService::Impl {
         snapshot.ipAddress = context->camera.ipAddress; snapshot.onvifStatus = onvifStatus;
         snapshot.streamUri = relay.uri(snapshot.id);
         snapshot.directStreamUri = context->camera.rtspUrl;
-        if (!config.webRtcBaseUrl.empty()) snapshot.webRtcUri = config.webRtcBaseUrl + "/" + snapshot.id + "/whep";
+        snapshot.webRtcEnabled=config.webRtcEnabled && WebRtcGateway::available();
         api.updateCamera(snapshot);
         contexts[snapshot.id] = context;
         auto options = config; options.cameraId = snapshot.id; options.rtspUrl = context->camera.rtspUrl;
@@ -86,13 +98,13 @@ struct CameraService::Impl {
             context->streamStatus.store(status);
             auto& s = context->snapshot; s.status = status;
             if (status != CameraStatus::ONLINE) {
-                recordings.offline(id); relay.setOffline(id); s.streamReady = false; s.codec.clear(); s.width = s.height = 0; s.fps = 0;
+                recordings.offline(id); relay.setOffline(id); webRtc.offline(id); s.streamReady = false; s.codec.clear(); s.width = s.height = 0; s.fps = 0;
                 s.timeBaseNum = 0; s.timeBaseDen = 1; s.packets = s.bytes = 0;
             }
             api.updateCamera(s);
         };
         callbacks.onStream = [this, context](const std::string& id, const AVFormatContext* input, int index) {
-            recordings.configure(id, input, index); relay.configure(id, input, index); auto& s = context->snapshot; const auto* stream = input->streams[index];
+            recordings.configure(id, input, index); relay.configure(id, input, index); webRtc.configure(id,input,index); auto& s = context->snapshot; const auto* stream = input->streams[index];
             s.codec = "H264"; s.width = stream->codecpar->width; s.height = stream->codecpar->height;
             auto fps = stream->avg_frame_rate; if (fps.num <= 0 || fps.den <= 0) fps = stream->r_frame_rate;
             s.fps = fps.num > 0 && fps.den > 0 ? av_q2d(fps) : 0;
@@ -100,7 +112,7 @@ struct CameraService::Impl {
             api.updateCamera(s);
         };
         callbacks.onPacket = [this, context](const std::string& id, const AVPacket* packet) {
-            recordings.pushPacket(id, packet); relay.pushPacket(id, packet); auto& s = context->snapshot; ++s.packets; s.bytes += static_cast<std::uint64_t>(packet->size);
+            recordings.pushPacket(id, packet); relay.pushPacket(id, packet); webRtc.pushPacket(id,packet); auto& s = context->snapshot; ++s.packets; s.bytes += static_cast<std::uint64_t>(packet->size);
             const auto now = std::chrono::steady_clock::now();
             if (now - context->lastUpdate >= std::chrono::seconds(1)) {
                 s.streamReady = relay.ready(id); api.updateCamera(s); context->lastUpdate = now;
@@ -201,7 +213,7 @@ struct CameraService::Impl {
             }
             try {
                 const auto command = job.request.value("command", std::string{});
-                if (command == "START_RECORDING" || command == "STOP_RECORDING" || command == "GET_RECORDINGS") {
+                if (command == "START_RECORDING" || command == "STOP_RECORDING" || command == "SET_AUTO_RECORDING" || command == "GET_RECORDINGS") {
                     const auto id = field(job.request, "cameraId", 128);
                     if (id.empty() || id.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") != std::string::npos) throw std::runtime_error("Invalid recording cameraId");
                     if (command != "GET_RECORDINGS" && !contexts.count(id)) { job.done(failure(job.request, "CAMERA_NOT_FOUND", "Camera is not registered")); continue; }
@@ -213,12 +225,12 @@ struct CameraService::Impl {
             } catch (const std::exception& error) {
                 if (job.done) {
                     const auto command = job.request.value("command", std::string{});
-                    const bool recording = command == "START_RECORDING" || command == "STOP_RECORDING" || command == "GET_RECORDINGS";
+                    const bool recording = command == "START_RECORDING" || command == "STOP_RECORDING" || command == "SET_AUTO_RECORDING" || command == "GET_RECORDINGS";
                     job.done(failure(job.request, recording ? "RECORDING_ERROR" : "ONVIF_ERROR", error.what()));
                 }
             }
         }
-        chat.stop(); events.stop(); ptz.shutdown(); streams.stopAll(); recordings.stop(); contexts.clear();
+        chat.stop(); events.stop(); ptz.shutdown(); streams.stopAll(); webRtc.stop(); recordings.stop(); contexts.clear();
         std::deque<Job> remaining;
         { std::lock_guard<std::mutex> lock(mutex); remaining.swap(jobs); }
         for (const auto& job : remaining) if (job.done) job.done(failure(job.request, "SHUTTING_DOWN", "VMS is stopping"));
@@ -238,16 +250,17 @@ CameraService::CameraService(StreamConfig config, WebSocketServer& api, RtspRela
     impl_->api.updateCamera(snapshot);
 }
 CameraService::~CameraService() { stop(); }
-void CameraService::start() { impl_->events.start(); impl_->chat.start(); impl_->ptz.start(); impl_->recordings.start(); impl_->worker = std::thread([this] { impl_->run(); }); }
+void CameraService::start() { impl_->webRtc.start(); impl_->events.start(); impl_->chat.start(); impl_->ptz.start(); impl_->recordings.start(); impl_->worker = std::thread([this] { impl_->run(); }); }
 void CameraService::stop() {
     { std::lock_guard<std::mutex> lock(impl_->mutex); impl_->stopping.store(true); }
     impl_->wake.notify_all(); if (impl_->worker.joinable()) impl_->worker.join();
 }
-void CameraService::disconnect(std::uint64_t session) { impl_->ptz.disconnect(session); impl_->chat.disconnect(session); }
+void CameraService::disconnect(std::uint64_t session) { impl_->webRtc.disconnect(session); impl_->ptz.disconnect(session); impl_->chat.disconnect(session); }
 void CameraService::request(const Json& request, std::function<void(Json)> completion) {
     const auto command = request.value("command", std::string{});
+    if(command=="WEBRTC_START" || command=="WEBRTC_ANSWER" || command=="WEBRTC_STOP"){impl_->webRtc.request(request,std::move(completion));return;}
     if (command == "CHAT_SEARCH") { impl_->chat.request(request,std::move(completion)); return; }
-    if (command == "GET_EVENTS" || command == "GET_DETECTIONS" || command == "GET_EVENT_PLAYBACK") {
+    if (command == "GET_METADATA_STATUS" || command == "GET_EVENTS" || command == "GET_DETECTIONS" || command == "GET_EVENT_PLAYBACK") {
         impl_->events.request(request,std::move(completion)); return;
     }
     if (command == "PTZ_MOVE" || command == "PTZ_STOP" || command == "PTZ_CENTER" || command == "TRACKING_ON" || command == "TRACKING_OFF") {

@@ -25,6 +25,8 @@ public:
     void abort() noexcept;
     bool active() const;
     std::string filePath() const;
+    std::int64_t startTimeMs() const;
+    std::int64_t endTimeMs() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

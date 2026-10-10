@@ -17,7 +17,8 @@ struct CameraSnapshot {
     std::uint64_t packets = 0, bytes = 0;
     std::string streamUri;
     // 공개 cameraJson에는 넣지 않는다. 직접 재생 REST 요청에서만 일시적으로 제공한다.
-    std::string directStreamUri, webRtcUri;
+    std::string directStreamUri;
+    bool webRtcEnabled=false;
     bool streamReady = false;
     bool ptzReady = false, ptzCenter = false;
     bool trackingSupported = false;
@@ -43,6 +44,7 @@ public:
     void updateCamera(const CameraSnapshot&);
     void updateEvents(const std::string& id,const std::string& state);
     void notify(const std::string& id,const std::string& event,const nlohmann::json& data);
+    void notifySession(std::uint64_t session,const std::string& cameraId,const std::string& event,const nlohmann::json& data);
     unsigned short port() const;
     nlohmann::json cameraIds() const;
 private:

@@ -88,6 +88,8 @@ struct EventManager::Impl {
     StreamConfig config;
     Publish publish;
     Status status;
+    RecordingState recordingState;
+    Observation observation;
     std::atomic<bool> stopping{false};
     struct Receiver {
         std::atomic<bool> cancel{false};
@@ -107,7 +109,8 @@ struct EventManager::Impl {
     std::map<std::string,std::int64_t> latestSource;
     std::map<std::string,std::string> latestPayload;
     std::map<std::string,Json> pendingMetadata;
-    Impl(StreamConfig c,Publish p,Status s):config(std::move(c)),publish(std::move(p)),status(std::move(s)) {}
+    std::map<std::string,Json> diagnostics; // DB worker 전용. 초기 상태를 탐지 없음으로 추측하지 않는다.
+    Impl(StreamConfig c,Publish p,Status s,RecordingState r,Observation o):config(std::move(c)),publish(std::move(p)),status(std::move(s)),recordingState(std::move(r)),observation(std::move(o)) {}
     bool enqueue(Task task) {
         std::lock_guard<std::mutex> lock(mutex);
         if (stopping.load() || queue.size()>=512) return false;
@@ -201,12 +204,33 @@ struct EventManager::Impl {
                 if (now-lastPrune>std::chrono::minutes(10)) { repository->prune(config.eventRetentionDays,config.metadataRetentionDays); lastPrune=now; }
                 if (task.done) {
                     const auto command=task.request.value("command",std::string{});
-                    task.done(reply(task.request,true,command=="GET_EVENTS" ? repository->search(task.request)
-                        : command=="GET_DETECTIONS" ? repository->detections(task.request) : repository->playback(task.request)));
+                    Json data;
+                    if (command=="GET_METADATA_STATUS") {
+                        const auto id=task.request.value("cameraId",std::string{});
+                        data=repository->status(id);
+                        data["lastReceivedTimeMs"]=nullptr; data["detected"]=nullptr; data["detectedAtMs"]=nullptr;
+                        if (diagnostics.count(id)) data.update(diagnostics.at(id));
+                        data["samplingEnabled"]=config.metadataSampleMs>0;
+                        data["recording"]=recordingState ? recordingState(id) : Json::object();
+                    } else if (command=="GET_EVENTS") data=repository->search(task.request);
+                    else if (command=="GET_DETECTIONS") data=repository->detections(task.request);
+                    else {
+                        data=repository->playback(task.request);
+                        if (data.value("reason",std::string{})=="NO_RECORDING_AT_TIME" && recordingState) {
+                            const auto rec=recordingState(data.at("cameraId").get<std::string>());
+                            const auto time=data.at("lookupTimeMs").get<std::int64_t>();
+                            if (rec.value("recording",false) && rec["startTimeMs"].is_number_integer() && rec["endTimeMs"].is_number_integer()
+                                && time>=rec["startTimeMs"].get<std::int64_t>() && time<rec["endTimeMs"].get<std::int64_t>())
+                                data["reason"]="RECORDING_IN_PROGRESS";
+                        }
+                    }
+                    task.done(reply(task.request,true,data));
                     continue;
                 }
                 const auto& m=task.metadata; const auto id=m.at("cameraId").get<std::string>();
                 const auto key=id+":"+m.at("topic").get<std::string>();
+                auto& diagnostic=diagnostics[id];
+                diagnostic["lastReceivedTimeMs"]=m.at("receivedTimeMs");
                 // 반복/오래된 snapshot이 overlay를 과거 위치로 되돌리거나 sample DB를 채우지 않게 한다.
                 if (m.at("sourceTimeMs").is_number_integer()) {
                     const auto source=m.at("sourceTimeMs").get<std::int64_t>();
@@ -214,6 +238,11 @@ struct EventManager::Impl {
                     if (m.at("topic")!="Runtime/StateEvent" && previous!=latestSource.end() && source<previous->second) continue;
                     if (previous!=latestSource.end() && source==previous->second && latestPayload[key]==m.at("rawItems").dump()) continue;
                 } else if (latestPayload.count(key) && latestPayload[key]==m.at("rawItems").dump()) continue;
+                if (m.at("topic")=="Analytics/PersonDetection") {
+                    diagnostic["detected"]=m.at("detected"); diagnostic["detectedAtMs"]=m.at("receivedTimeMs");
+                }
+                // 저장 샘플링/overlay 전송 간격과 무관하게 유효한 상태를 녹화 worker에 전달한다.
+                if (observation) observation(id,m);
                 if (auto event=repository->transition(m)) publish(id,"CAMERA_EVENT",*event);
                 if (m.at("topic")=="Runtime/StateEvent") continue;
                 if (config.metadataSampleMs && now-sampled[key]>=std::chrono::milliseconds(config.metadataSampleMs)) {
@@ -234,7 +263,7 @@ struct EventManager::Impl {
         flushMetadata();
     }
 };
-EventManager::EventManager(StreamConfig config,Publish publish,Status status):impl_(std::make_unique<Impl>(std::move(config),std::move(publish),std::move(status))) {}
+EventManager::EventManager(StreamConfig config,Publish publish,Status status,RecordingState recording,Observation observation):impl_(std::make_unique<Impl>(std::move(config),std::move(publish),std::move(status),std::move(recording),std::move(observation))) {}
 EventManager::~EventManager() { stop(); }
 void EventManager::start() { impl_->database=std::thread([this]{impl_->runDatabase();}); }
 void EventManager::configure(const CameraInfo& camera,const std::string& profile) {

@@ -58,6 +58,21 @@ EventRepository::EventRepository(const std::string& path) {
     } catch (...) { sqlite3_close(db); db_ = nullptr; throw; }
 }
 EventRepository::~EventRepository() { if (db_) sqlite3_close(static_cast<sqlite3*>(db_)); }
+nlohmann::json EventRepository::status(const std::string& id) {
+    if (id.empty() || id.size()>128) throw std::runtime_error("cameraId required");
+    auto* db=static_cast<sqlite3*>(db_);
+    Json result{{"cameraId",id}};
+    // 보존 정책 적용 후 DB에 실제로 남아 있는 개수이며 누적 탐지 횟수가 아니다.
+    for (const auto& item : std::vector<std::pair<std::string,std::string>>{{"storedDetections","detection_index"},{"storedEvents","events"},{"storedMetadata","metadata_samples"}}) {
+        auto s=prepare(db,"SELECT count(*) FROM "+item.second+" WHERE camera_id=?;"); bindText(s.get(),1,id);
+        if (sqlite3_step(s.get())!=SQLITE_ROW) throw std::runtime_error("Metadata count failed");
+        result[item.first]=sqlite3_column_int64(s.get(),0);
+    }
+    auto s=prepare(db,"SELECT max(received_time_ms) FROM metadata_samples WHERE camera_id=?;"); bindText(s.get(),1,id);
+    if (sqlite3_step(s.get())!=SQLITE_ROW) throw std::runtime_error("Metadata status failed");
+    result["lastStoredTimeMs"]=sqlite3_column_type(s.get(),0)==SQLITE_NULL ? Json(nullptr) : Json(sqlite3_column_int64(s.get(),0));
+    return result;
+}
 std::optional<nlohmann::json> EventRepository::transition(const Json& m) {
     if (m.at("topic")=="Runtime/StateEvent") {
         const auto type=m.value("eventType",Json(nullptr));

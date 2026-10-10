@@ -1,19 +1,28 @@
 #pragma once
-#include "core/Result.h"
+#include "core/Config.h"
+#include <functional>
+#include <memory>
+#include <nlohmann/json.hpp>
 #include <string>
 struct AVPacket;
 struct AVFormatContext;
 namespace vms {
-struct WebRtcClient { std::string cameraId, clientId, offerSdp; };
 class WebRtcGateway {
 public:
-    virtual ~WebRtcGateway() = default;
-    virtual Result startStream(const std::string& cameraId, const AVFormatContext*, int videoIndex) = 0;
-    virtual Result stopStream(const std::string& cameraId) = 0;
-    virtual Result addClient(const WebRtcClient&) = 0;
-    virtual void removeClient(const std::string& clientId) = 0;
-    virtual Result pushPacket(const std::string& cameraId, const AVPacket*) = 0;
-    virtual Result addIceCandidate(const std::string& clientId, const std::string& candidate) = 0;
-    // Answer SDP and local ICE are delivered to ClientServer through a future async sink.
+    using Json=nlohmann::json;
+    using Notify=std::function<void(std::uint64_t,const std::string&,const Json&)>;
+    WebRtcGateway(StreamConfig,Notify);
+    ~WebRtcGateway();
+    static bool available();
+    void start();
+    void stop();
+    void configure(const std::string&,const AVFormatContext*,int);
+    void offline(const std::string&);
+    void pushPacket(const std::string&,const AVPacket*);
+    void request(const Json&,std::function<void(Json)>);
+    void disconnect(std::uint64_t session);
+private:
+    struct Impl;
+    std::shared_ptr<Impl> impl_;
 };
 }

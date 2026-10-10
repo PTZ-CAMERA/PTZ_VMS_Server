@@ -30,11 +30,11 @@ const char* statusName(CameraStatus status) {
 }
 Json cameraJson(const CameraSnapshot& s) {
     return {{"id", s.id}, {"name", s.name}, {"ipAddress", s.ipAddress}, {"status", statusName(s.status)},
-        {"recording", s.recording}, {"recordingRequested", s.recordingRequested}, {"recordingState", s.recordingState}, {"recordingError", s.recordingError}, {"onvifStatus", s.onvifStatus}, {"webRtcStatus", s.webRtcUri.empty() ? "NOT_CONFIGURED" : "EXTERNAL_GATEWAY_CONFIGURED"}, {"eventsStatus",s.eventsStatus},
+        {"recording", s.recording}, {"recordingRequested", s.recordingRequested}, {"recordingState", s.recordingState}, {"recordingError", s.recordingError}, {"onvifStatus", s.onvifStatus}, {"webRtcStatus", s.webRtcEnabled ? "NATIVE_AVAILABLE" : "DISABLED"}, {"eventsStatus",s.eventsStatus},
         {"codec", s.codec}, {"width", s.width}, {"height", s.height}, {"fps", s.fps},
         {"timeBase", {{"num", s.timeBaseNum}, {"den", s.timeBaseDen}}},
         {"packets", s.packets}, {"bytes", s.bytes},
-        {"capabilities", {{"ptz", s.ptzReady}, {"ptzCenter", s.ptzCenter}, {"tracking", s.trackingSupported}, {"live", s.streamReady}, {"directLive", !s.directStreamUri.empty()}, {"webRtcLive", !s.webRtcUri.empty()}, {"recordings", true}, {"events", s.eventsEnabled}, {"chatSearch",s.chatEnabled}}}};
+        {"capabilities", {{"ptz", s.ptzReady}, {"ptzCenter", s.ptzCenter}, {"tracking", s.trackingSupported}, {"live", s.streamReady}, {"directLive", !s.directStreamUri.empty()}, {"webRtcLive", s.webRtcEnabled}, {"recordings", true}, {"events", s.eventsEnabled}, {"chatSearch",s.chatEnabled}}}};
 }
 class Session;
 struct State : std::enable_shared_from_this<State> {
@@ -124,10 +124,9 @@ struct State : std::enable_shared_from_this<State> {
             if (camera == copy.end()) return failure("CAMERA_NOT_FOUND", "Camera is not registered");
             if (command == "GET_WEB_STREAM") {
                 const auto& value = camera->second;
-                if (value.webRtcUri.empty()) return failure("WEBRTC_NOT_CONFIGURED", "Configure the PC MediaMTX gateway URL");
-                // 설정/relay 준비와 실제 ICE 연결 성공은 구분한다. LIVE 판정은 Web의 decoded frame으로 한다.
-                data = {{"cameraId", value.id}, {"protocol", "webrtc"}, {"source", "vms"}, {"uri", value.webRtcUri},
-                    {"ready", value.status == CameraStatus::ONLINE && value.streamReady}, {"gateway", "mediamtx"}};
+                if (!value.webRtcEnabled) return failure("WEBRTC_DISABLED", "Native WebRTC is disabled");
+                data = {{"cameraId",value.id},{"protocol","webrtc"},{"source","vms"},{"signaling","websocket"},
+                    {"ready",value.status==CameraStatus::ONLINE && value.codec=="H264"},{"gateway","native"}};
             } else data = {{"camera", cameraJson(camera->second)}};
         }
         return {{"version", 1}, {"type", "response"}, {"requestId", id}, {"ok", true}, {"data", data}};
@@ -210,7 +209,7 @@ private:
             const auto preliminary = owner->dispatch(request);
             const auto command = request.is_object() && request.contains("command") && request["command"].is_string()
                 ? request["command"].get<std::string>() : std::string{};
-            if (owner->commandHandler && (command == "DISCOVER_CAMERAS" || command == "REGISTER_CAMERA" || command == "START_RECORDING" || command == "STOP_RECORDING" || command == "GET_RECORDINGS" || command == "PTZ_MOVE" || command == "PTZ_STOP" || command == "PTZ_CENTER" || command == "TRACKING_ON" || command == "TRACKING_OFF" || command == "GET_EVENTS" || command == "GET_DETECTIONS" || command == "GET_EVENT_PLAYBACK" || command == "CHAT_SEARCH")
+            if (owner->commandHandler && (command == "WEBRTC_START" || command == "WEBRTC_ANSWER" || command == "WEBRTC_STOP" || command == "DISCOVER_CAMERAS" || command == "REGISTER_CAMERA" || command == "START_RECORDING" || command == "STOP_RECORDING" || command == "SET_AUTO_RECORDING" || command == "GET_RECORDINGS" || command == "PTZ_MOVE" || command == "PTZ_STOP" || command == "PTZ_CENTER" || command == "TRACKING_ON" || command == "TRACKING_OFF" || command == "GET_METADATA_STATUS" || command == "GET_EVENTS" || command == "GET_DETECTIONS" || command == "GET_EVENT_PLAYBACK" || command == "CHAT_SEARCH")
                 && preliminary.contains("error") && preliminary["error"].value("code", std::string{}) == "NOT_SUPPORTED") {
                 std::weak_ptr<Session> weak = self;
                 std::weak_ptr<State> weakOwner = owner;
@@ -388,5 +387,11 @@ void WebSocketServer::notify(const std::string& id,const std::string& event,cons
         if(event=="EVENT_RECEIVER_STATUS" && (data.value("state",std::string{})=="RECONNECTING" || data.value("state",std::string{})=="STOPPED" || data.value("state",std::string{})=="DATABASE_ERROR"))state->lastTracking.erase(id);
         state->broadcast(text);
     });
+}
+void WebSocketServer::notifySession(std::uint64_t session,const std::string& camera,const std::string& event,const Json& data){
+    if(!impl_->running.load())return;
+    const auto text=Json{{"version",1},{"type","notification"},{"event",event},{"cameraId",camera},{"data",data}}.dump();
+    if(text.size()>65536)return;
+    net::post(impl_->context,[state=impl_->state,session,text]{const auto it=state->sessions.find(session);if(it!=state->sessions.end()&&!state->stopping)it->second->send(text);});
 }
 }
