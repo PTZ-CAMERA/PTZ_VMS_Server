@@ -5,7 +5,8 @@
 #include <optional>
 #include <vector>
 namespace vms {
-// M3/M4 contract; dedicated DB worker owns connection; callers submit jobs.
+// 초기 설계의 추상 계약이다. 현재 저장/조회 구현은 RecordingRepository와
+// EventRepository이며 각각의 작업 worker가 SQLite 연결을 소유한다.
 class DatabaseManager {
 public:
     virtual ~DatabaseManager() = default;

@@ -173,3 +173,7 @@ Gemini에는 질문·카메라 ID·시각·검증된 이전 조건만 전달하�
 [Pi / PTZ_CAMERA](https://github.com/PTZ-CAMERA/PTZ_CAMERA) · [Qt_Client](https://github.com/PTZ-CAMERA/Qt_Client) · [PTZ_WEB_Client](https://github.com/PTZ-CAMERA/PTZ_WEB_Client)
 
 날짜별 세션 문서는 작성 당시 기록이며 현재 기능은 이 README와 소스를 기준으로 확인합니다.
+
+## 코드 안내
+
+DB 헤더는 include/database/에 두며 이전 event/EventRepository.h include는 호환 헤더로 유지합니다. 초기 추상 계약과 실제 실행 클래스를 구분하고 핵심 코드에 worker 소유권·수명·시간 기준을 설명했습니다. [CODE_GUIDE](docs/CODE_GUIDE.md)

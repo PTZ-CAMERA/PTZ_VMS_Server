@@ -12,7 +12,8 @@ struct RecordingInfo {
     double duration = 0;
     int width = 0, height = 0;
 };
-// M5: database failures are exceptions; nullopt means no matching completed segment.
+// 초기 설계의 추상 계약이다. 현재 완료 구간 조회는 RecordingRepository 및
+// EventRepository에서 수행하고 Qt PlaybackWidget이 실제 로컬 재생을 담당한다.
 class PlaybackManager {
 public:
     virtual ~PlaybackManager() = default;

@@ -1,6 +1,6 @@
 #include "core/UtcTimestamp.h"
 #include "event/EventManager.h"
-#include "event/EventRepository.h"
+#include "database/EventRepository.h"
 #include "database/RecordingRepository.h"
 #include <filesystem>
 #include <fstream>

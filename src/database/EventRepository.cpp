@@ -1,4 +1,4 @@
-#include "event/EventRepository.h"
+#include "database/EventRepository.h"
 #include "core/UtcTimestamp.h"
 #include <sqlite3.h>
 #include <filesystem>
@@ -214,6 +214,8 @@ nlohmann::json EventRepository::searchRecords(const Json& request,bool observati
     return {{observations ? "detections" : "events",list},{"nextCursor",cursor}};
 }
 nlohmann::json EventRepository::playback(const Json& request) {
+    // eventId(상태 변경)와 sampleId(탐지 샘플)는 서로 다른 ID 공간이다.
+    // 파일을 찾았더라도 미확정/삭제/범위 밖/정확도 불충분이면 playable=false를 유지한다.
     const bool sample=request.contains("sampleId");
     if (sample && request.contains("eventId")) throw std::runtime_error("Use eventId or sampleId, not both");
     const auto eventId=integer(request,sample ? "sampleId" : "eventId",0); if (eventId<1) throw std::runtime_error("eventId/sampleId required");

@@ -1,5 +1,7 @@
+// 수신 worker는 ONVIF 통신을, DB worker는 검증·중복 제거·저장·검색을 담당한다.
+// recording callback에는 유효 관측을 전달하며 누락된 탐지 값을 false로 만들지 않는다.
 #include "event/EventManager.h"
-#include "event/EventRepository.h"
+#include "database/EventRepository.h"
 #include "onvif/CurlOnvifClient.h"
 #include "core/Logger.h"
 #include "core/UtcTimestamp.h"

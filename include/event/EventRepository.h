@@ -1,24 +1,4 @@
 #pragma once
-#include <nlohmann/json.hpp>
-#include <optional>
-#include <string>
-namespace vms {
-// 이벤트 DB worker만 이 연결을 사용한다. 기존 recorder 연결은 공유하지 않는다.
-class EventRepository {
-public:
-    explicit EventRepository(const std::string& path);
-    ~EventRepository();
-    EventRepository(const EventRepository&) = delete;
-    EventRepository& operator=(const EventRepository&) = delete;
-    std::optional<nlohmann::json> transition(const nlohmann::json& metadata);
-    void sample(const nlohmann::json& metadata);
-    void prune(unsigned eventDays,unsigned sampleDays);
-    nlohmann::json search(const nlohmann::json& request);
-    nlohmann::json detections(const nlohmann::json& request);
-    nlohmann::json playback(const nlohmann::json& request);
-    nlohmann::json status(const std::string& cameraId);
-private:
-    nlohmann::json searchRecords(const nlohmann::json&,bool detections);
-    void* db_ = nullptr;
-};
-}
+// 이전 include 경로를 사용하는 호출부를 위한 호환 헤더.
+// 실제 DB 계약은 database/EventRepository.h에서 관리한다.
+#include "database/EventRepository.h"

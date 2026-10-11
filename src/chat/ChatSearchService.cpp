@@ -1,3 +1,5 @@
+// 모델은 검색 조건만 제안한다. 검증된 조건으로 실제 DB를 조회하는 책임은 VMS에 있고,
+// 대화·페이지·결과 선택 상태는 WebSocket 세션마다 분리한다.
 #include "chat/ChatSearchService.h"
 #include "chat/LlmClient.h"
 #include "core/UtcTimestamp.h"

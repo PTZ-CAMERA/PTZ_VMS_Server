@@ -1,3 +1,5 @@
+// 파일·muxer·녹화 정책은 이 worker가 소유한다. 수신 스레드는 참조 복제한 packet을
+// 전달하고, 다른 모듈은 mutex로 보호한 snapshot만 읽는다.
 #include "recording/RecordingManager.h"
 #include "core/Logger.h"
 extern "C" {
@@ -74,6 +76,7 @@ struct RecordingManager::Impl {
         if (callback) callback(id, status);
     }
     void snapshotTrack(const std::string& id, const Track& track) {
+        // muxer 자체는 공유하지 않는다. 미확정 파일 경로도 외부 조회에 제공하지 않는다.
         auto data = statusJson(id, track.status);
         data.erase("filePath"); // 아직 확정되지 않은 파일 경로는 클라이언트에 제공하지 않는다.
         data["autoRecordingEnabled"]=track.autoEnabled; data["manualRecording"]=track.manual;
@@ -116,6 +119,8 @@ struct RecordingManager::Impl {
                 }
             }
             if (task.packet) {
+                // 과부하를 숨기지 않는다. 대기 영상은 비우되 명령은 보존하고,
+                // worker가 현재 구간을 확정한 뒤 다음 keyframe부터 새 구간을 시작한다.
                 if (tasks.size() >= 1024 || queuedBytes + static_cast<std::size_t>(task.packet->size) > 16 * 1024 * 1024) {
                     for (auto it = tasks.begin(); it != tasks.end();) { if (it->packet) it = tasks.erase(it); else ++it; }
                     queuedBytes = 0; overflow = true;
@@ -258,6 +263,8 @@ struct RecordingManager::Impl {
         tracks.clear(); repository.reset();
     }
     void expireAutomatic() {
+        // 상태 판단은 worker에서 직렬화한다. 수동 소유권·사람 있음·Events 오류는
+        // 자동 종료 대상이 아니며, 타이머에는 시스템 UTC 대신 steady_clock을 쓴다.
         const auto now=std::chrono::steady_clock::now();
         for (auto& entry:tracks) {
             auto& t=entry.second;
