@@ -37,8 +37,10 @@ EventRepository의 실제 헤더는 `include/database/EventRepository.h`로 구�
 - SDP는 해당 WS 세션에만 보낸다. socket 종료와 ICE 완료가 경쟁해도 요청 응답은 한 번이다.
 - 모델은 검색 조건만 제안하며 SQL·파일 존재·재생 가능 여부는 VMS가 확인한다.
 
-## 이번 정리의 범위와 검증
+## 문서와 디렉토리 관리
 
-DB 헤더 위치·include 참조, 핵심 주석, WebRtcGateway의 공백/줄바꿈만 정리했다. API·설정·큐 상한·스레드·제어 정책·DB schema는 변경하지 않았다. C++ 토큰 비교로 로직 동일성을 확인하고 기존 CTest와 합성 WebRTC 시험으로 경로를 확인한다. 실물 Pi/모터 시험이나 서비스를 실행하지 않는다.
+[문서 안내](README.md)에서 현재 계약과 초기 설계를 구분한다. 기존 헤더 호환 경로,
+CMake 대상, 설정·DB·녹화 경로는 유지한다. 이번 정리는 현재 작업 트리를 기준으로
+주석과 문서만 보완하며 기존 미커밋 기능 변경을 덮어쓰지 않는다.
 
-[전체 시스템](../README.md) · [영상 경로](LIVE_ROUTING.md) · [자동 녹화](AUTO_RECORDING.md)
+[전체 시스템](SYSTEM_ARCHITECTURE.md) · [영상 경로](LIVE_ROUTING.md) · [자동 녹화](AUTO_RECORDING.md)

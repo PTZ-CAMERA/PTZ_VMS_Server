@@ -96,6 +96,8 @@ struct RecordingManager::Impl {
         log(id, "REC", error); publish(id, track);
     }
     void checkResult(const Result& result) { if (!result.ok) throw std::runtime_error(result.error); }
+    // 수신 스레드는 작업을 전달하고, muxer와 녹화 DB는 worker가 소유한다.
+    // 아래 영상 상한과 별도로 명령은 최대 64개다. 거절된 요청을 성공으로 응답하지 않는다.
     bool enqueue(Task task) {
         {
             std::lock_guard<std::mutex> lock(mutex);

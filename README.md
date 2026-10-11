@@ -1,5 +1,7 @@
 # Mini VMS Server
 
+[문서 안내](docs/README.md) · [최신 전체 구조도](docs/SYSTEM_ARCHITECTURE.md)
+
 Raspberry Pi Edge AI PTZ 카메라의 영상·제어·탐지 정보를 관리하는 C++17 서버 프로세스입니다. Qt GUI에 의존하지 않습니다. 현재 구성은 Qt의 Pi 직접 RTSP 라이브, VMS 내장 WebRTC를 통한 Web 라이브, PC 녹화·탐지/자연어 검색입니다.
 
 ## 전체 구조
@@ -101,7 +103,7 @@ cp config/vms.conf config/cam01.local.conf
 
 기존 로컬 설정이 있으면 복사 명령을 다시 실행하지 않고 해당 파일을 사용합니다.
 
-Windows native는 MSVC x64와 같은 compiler/architecture의 FFmpeg·libcurl·OpenSSL·libdatachannel SDK 및 CMake package가 필요합니다. 현재 VMS 빌드·WebRTC 검증 환경은 Linux/WSL입니다. Windows native VMS WebRTC 빌드는 아직 검증하지 않았습니다. SDK 없이 빌드하려면 -DVMS_ENABLE_WEBRTC=OFF를 사용하며 웹 라이브는 비활성화됩니다.
+Windows native는 MSVC x64와 같은 compiler/architecture의 FFmpeg·libcurl·OpenSSL·libdatachannel SDK 및 CMake package가 필요합니다. 현재 VMS 빌드·WebRTC 검증 환경은 Linux/WSL입니다. SDK 없이 빌드하려면 -DVMS_ENABLE_WEBRTC=OFF를 사용하며 웹 라이브는 비활성화됩니다.
 
 ## 설정·주소
 
@@ -153,18 +155,6 @@ PTZ 접수 ACCEPTED와 Pi ONVIF 응답 PI_ACKNOWLEDGED를 구분합니다. HTTP 
 Gemini에는 질문·카메라 ID·시각·검증된 이전 조건만 전달하고 영상이나 녹화 경로를 보내지 않습니다. 임의 SQL을 실행하지 않습니다. 사람 탐지 기록 기반 검색이며 인물 식별·옷 색상·행동 검색은 제공하지 않습니다.
 
 녹화 파일이 완료·존재하고 범위에 포함될 때만 playable=true입니다. 녹화 중은 RECORDING_IN_PROGRESS, 녹화가 없는 시각은 NO_RECORDING_AT_TIME으로 구분합니다. 현재 위치 연결은 receive_estimated이며 정확한 센서 캡처 프레임 동기화를 보장하지 않습니다. Qt의 2초 사전 재생 옵션은 이미 저장된 동일 파일 안에서만 적용합니다. 자동 녹화의 사전 녹화 버퍼는 없고 다음 keyframe부터 저장합니다.
-
-## Pi 버전 호환성
-
-현재 VMS Tracking은 ONVIF MoveAndStartTracking/Stop을 사용합니다. Pi 저장소의 최신 소스는 독립 HTTP Digest JSON /camera/control tracking_set/get을 추가했고 Stop 후 사용자 Tracking ON이면 AUTO로 복귀할 수 있습니다. **최신 Pi 소스에 맞는 독립 추적 OFF adapter는 아직 VMS에 연결하지 않았습니다.** 최신 소스·설치 바이너리 버전을 맞춘 뒤 실제 OFF 동작을 확인해야 합니다. 이번 문서 정리에서 Pi 서비스를 배포·재시작하지 않습니다.
-
-## 검증과 한계
-
-- 기존 VMS unit/통합 13개 및 native WebRTC 신호·세션 격리·최대 peer·정지 검사 통과.
-- 실제 Chromium에서 합성 RTSP → VMS 내부 WebRTC → 1280×720 디코딩, 정지·재연결·브라우저 오류 없음 확인.
-- Web Playwright 11개, Qt Linux UI/WS 및 Windows Qt mock·합성 파일 시험 통과.
-- 실제 Gemini 한국어 조건 변환은 확인했으며 실제 사람 탐지→자동 녹화→자연어 검색→Qt 재생 전체 실물 검증은 남아 있습니다.
-- 단일 카메라 중심 검증. 다중 카메라 부하·장시간 안정성·원격 녹화 파일 전달·영구 카메라 등록·정확한 PTS↔UTC 연결은 후속 과제입니다.
 
 ## 문서·관련 저장소
 

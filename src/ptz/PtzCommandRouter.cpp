@@ -33,6 +33,7 @@ struct PtzCommandRouter::Impl {
         CameraInfo camera;
         std::string profile;
         PtzConfiguration options;
+        // 소유자는 카메라 ID가 아니라 WebSocket 세션 ID다. Qt와 Web의 동시 제어를 막는다.
         std::uint64_t owner = 0;
         bool busy = false, stopping = false, tracking = false;
         Clock::time_point lease{};
@@ -131,6 +132,8 @@ void PtzCommandRouter::request(const Json& request, Reply reply) {
     if (!session || impl_->closing) return reject("UNAVAILABLE");
     auto it = impl_->targets.find(id); if (it == impl_->targets.end()) return reject("PTZ_NOT_AVAILABLE");
     auto& target = it->second;
+    // 영상 재생 가능 여부와 제어권은 별개다. 다른 세션의 STOP도 소유권 검사 대상이다.
+    // Tracking 소유권은 이동 lease만으로 해제되지 않고 명시적 정지/연결 종료를 따른다.
     if (target.owner && target.owner != session) return reject("PTZ_BUSY");
     if (target.stopping) return reject("PTZ_STOPPING");
     const auto& space = target.options.velocity;
